@@ -350,7 +350,7 @@ def show_process(r: Rule) -> str:
     text = str(p)
     for prefix, shown in (("path.", "/"), ("script.", "script /"), ("identifier.", "")):
         if text.startswith(prefix):
-            return shown + text[len(prefix):]
+            return shown + text[len(prefix):].lstrip("/")     # script. keeps its leading /, path. drops it
     return text
 
 
@@ -1278,6 +1278,8 @@ def t_list_verdicts(t: T) -> None:
     _, out2, _ = t.run(["list"])
     t.check([x.split("\t")[0] for x in out2.splitlines()] == [x.split("\t")[0] for x in lines],
             "the IDs stay the same while Little Snitch's counters move")
+    t.check(show_process({"process": "script./usr/local/bin/x.sh"}) == "script /usr/local/bin/x.sh"
+            and show_process({"process": "path.opt/x"}) == "/opt/x", "one slash before a script's or a path's path")
     _, out3, _ = t.run(["list", "pypi"])
     t.check(out3.splitlines() == [lines[1]], f"a FILTER: {out3}")
 
