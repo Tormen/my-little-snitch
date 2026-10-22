@@ -1,0 +1,1500 @@
+#!/usr/bin/env python3
+"""my-little-snitch -- Little Snitch's rules and traffic from the command line.
+
+A wrapper around Little Snitch's own `littlesnitch`, which can export and
+restore the whole rule model and print the traffic log, but has no command to
+add or remove ONE rule. `my-little-snitch --help` says how to drive it.
+
+One file, in this order:
+  1. output, errors, config
+  2. littlesnitch: calling it, the model, a rule as one line
+  3. programs: a name or path -> the rule's process (Homebrew versions -> '*')
+  4. changing the model: lock, backup, restore, verify
+  5. commands, main, --run-tests
+"""
+
+from __future__ import annotations
+
+import contextlib
+import csv
+import datetime
+import fnmatch
+import getpass
+import glob
+import hashlib
+import io
+import json
+import os
+import pwd
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, Final, Generator, List, NoReturn, Optional, Sequence, Tuple, cast
+
+SCRIPT_NAME: Final = "my-little-snitch"
+SCRIPT_VERSION: Final = "1.0"
+SCRIPT_COMMIT: Final = "unstamped"
+REPOSITORY: Final = "Tormen/my-little-snitch"      # whose tags --version may read as releases
+
+
+# --- 1. output, errors -----------------------------------------------------
+
+class SnitchError(Exception):
+    """The tool's one failure: a code naming the source line, and what to know."""
+
+    def __init__(self, code: str, text: str) -> None:
+        super().__init__(f"{code}: {text}")
+        self.code = code
+        self.text = text
+
+
+def err(code: str, text: str) -> NoReturn:
+    raise SnitchError(code, text)
+
+
+class Out:
+    """stdout carries results only; the narration goes to stderr (silenced by -Q)."""
+
+    def __init__(self) -> None:
+        self.quiet = False
+        self.vrb = False
+        self.dbg_on = False
+
+    def msg(self, text: str) -> None:
+        if not self.quiet:
+            print(text, file=sys.stderr, flush=True)
+
+    def det(self, text: str) -> None:
+        if self.vrb:
+            self.msg(text)
+
+    def dbg(self, text: str) -> None:
+        if self.dbg_on:
+            print(" ~~~ " + text, file=sys.stderr, flush=True)
+
+    def warn(self, text: str) -> None:
+        print("WARNING: " + text, file=sys.stderr, flush=True)
+
+    def error(self, text: str) -> None:
+        print(text, file=sys.stderr, flush=True)
+
+    def result(self, line: str) -> None:
+        print(line, flush=True)
+
+
+OUT = Out()
+_phase = "starting"
+
+
+def phase(text: str) -> None:
+    """What the run is doing now -- the Ctrl-C line names it."""
+    global _phase
+    _phase = text
+    OUT.dbg(f"phase: {text}")
+
+
+# --- 1. config -------------------------------------------------------------
+
+DEFAULT_CONFIG: Final = '''\
+## my-little-snitch.conf -- KEY="value" lines. my-little-snitch READS this
+## file, it never runs it: no commands; $NAME and ${NAME} expand a key set
+## above, or the environment. Searched, first found wins (--help).
+
+## Little Snitch's command line tool
+LITTLESNITCH="/Applications/Little Snitch.app/Contents/Components/littlesnitch"
+
+## where each change first saves the whole model (a JSON export), the lock,
+## and the record that 'diag roundtrip go' passed. Root only (0700).
+BACKUP_DIR="/var/db/my-little-snitch"
+
+## the owner of a new rule when --owner is not given: a user name (Little
+## Snitch's "Me" of that user), "anyone" or "system". "": --owner is required.
+OWNER_DEFAULT=""
+
+## where 'allow aria2c' looks for a bare program name, after $PATH
+PROGRAM_PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin"
+
+## the defaults of -Q / -V / -D ("1" = on)
+QUIET=""
+VRB=""
+DBG=""
+'''
+
+
+@dataclass(frozen=True)
+class Settings:
+    """The config, parsed: every key typed, every default from DEFAULT_CONFIG."""
+
+    files: Tuple[Path, ...]
+    littlesnitch: str
+    backup_dir: Path
+    owner_default: str
+    program_path: Tuple[str, ...]
+    quiet: bool
+    vrb: bool
+    dbg: bool
+
+
+def config_search_paths() -> List[Path]:
+    """Where the config is looked for, in order (after $MY_LITTLE_SNITCH_CONFIG and --config)."""
+    site = Path(os.environ.get("LINKS", "/LINKS")) / "default"
+    return [site / f"{SCRIPT_NAME}.conf", site / SCRIPT_NAME, Path.home() / f".{SCRIPT_NAME}.conf",
+            Path("/etc") / f"{SCRIPT_NAME}.conf", Path("/usr/local/etc") / f"{SCRIPT_NAME}.conf"]
+
+
+def config_offer() -> List[str]:
+    """Where to write a config, most common place first -- a FILTER of the
+    search list, so it never names a place that is not read."""
+    searched = config_search_paths()
+    return [str(p) for p in (Path("/etc") / f"{SCRIPT_NAME}.conf", Path.home() / f".{SCRIPT_NAME}.conf")
+            if p in searched]
+
+
+_KEY_LINE: Final = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_NAME_REF: Final = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _expand(text: str, names: Dict[str, str], where: str) -> str:
+    if "$(" in text or "`" in text:
+        err("00001", f"{where}: a command substitution -- {SCRIPT_NAME} reads its config, it never runs it")
+
+    def one(m: re.Match[str]) -> str:
+        name = m.group(1) or m.group(2)
+        if name in names:
+            return names[name]
+        if name in os.environ:
+            return os.environ[name]
+        if name == "USER":
+            return getpass.getuser()
+        if name == "HOME":
+            return str(Path.home())
+        err("00002", f"{where}: ${name} is not set (a key above, or the environment)")
+
+    return _NAME_REF.sub(one, text)
+
+
+def parse_value(raw: str, names: Dict[str, str], where: str) -> str:
+    """One shell word: unquoted, "double" ($ expanded) and 'single' parts, a
+    leading ~ as $HOME, then nothing but a # comment."""
+    out: List[str] = []
+    i = 0
+    while i < len(raw):
+        c = raw[i]
+        if c == "'":
+            j = raw.find("'", i + 1)
+            if j < 0:
+                err("00003", f"{where}: a ' is not closed")
+            out.append(raw[i + 1:j])
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            part: List[str] = []
+            while j < len(raw) and raw[j] != '"':
+                if raw[j] == "\\" and j + 1 < len(raw) and raw[j + 1] in '"\\$`':
+                    j += 1
+                part.append(raw[j])
+                j += 1
+            if j >= len(raw):
+                err("00004", f"{where}: a \" is not closed")
+            out.append(_expand("".join(part), names, where))
+            i = j + 1
+        elif c in " \t":
+            rest = raw[i:].strip()
+            if rest and not rest.startswith("#"):
+                err("00005", f"{where}: more than one word -- quote the value")
+            break
+        else:
+            m = re.match(r"[^'\" \t]+", raw[i:])
+            assert m is not None, "c is none of the characters the word stops at"
+            word = m.group(0)
+            i += len(word)
+            if not out and (word == "~" or word.startswith("~/")):
+                word = str(Path.home()) + word[1:]
+            out.append(_expand(word, names, where))
+    return "".join(out)
+
+
+def read_config_text(text: str, where: str, names: Dict[str, str]) -> List[str]:
+    """Add the KEY=value lines of `text` to `names`; return the keys it set."""
+    keys: List[str] = []
+    for n, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = _KEY_LINE.match(s)
+        if m is None:
+            err("00006", f"{where}:{n}: not a KEY=\"value\" line -- {SCRIPT_NAME} reads its config, it never runs it: {s[:60]}")
+        names[m.group(1)] = parse_value(m.group(2), names, f"{where}:{n}")
+        keys.append(m.group(1))
+    return keys
+
+
+def _flag(value: str, key: str, where: str) -> bool:
+    if value in ("", "0"):
+        return False
+    if value == "1":
+        return True
+    err("00007", f"{where}: {key}=\"{value}\" -- \"1\" (on) or \"\" (off)")
+
+
+def load_settings(override: Optional[str]) -> Settings:
+    """The config: the defaults, then <FILE>.GLOBAL, then <FILE> on top."""
+    phase("reading the config")
+    names: Dict[str, str] = {}
+    defaults = read_config_text(DEFAULT_CONFIG, "the built-in defaults", names)
+    chosen = override or os.environ.get("MY_LITTLE_SNITCH_CONFIG")
+    if chosen:
+        if not Path(chosen).is_file():
+            err("00008", f"config '{chosen}' not found (--config / $MY_LITTLE_SNITCH_CONFIG)")
+        found = Path(chosen)
+    else:
+        hits = [p for p in config_search_paths() if p.is_file()]
+        if not hits:
+            lines = "\n".join(f"        > {SCRIPT_NAME} --create-config > {p}" for p in config_offer())
+            err("00009", f"no config found -- write one, most common place first:\n{lines}\n"
+                         f"    ({SCRIPT_NAME} --help lists every place it is looked for)")
+        found = hits[0]
+    files = [p for p in (found.with_name(found.name + ".GLOBAL"), found) if p.is_file()]
+    for p in files:
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError as e:
+            err("00010", f"cannot read the config {p}: {e.strerror}")
+        for key in read_config_text(text, str(p), names):
+            if key not in defaults:
+                OUT.warn(f"{p}: {key} is not a {SCRIPT_NAME} setting -- ignored ('{SCRIPT_NAME} --create-config' lists them)")
+    where = " + ".join(str(p) for p in files)
+    return Settings(
+        files=tuple(files), littlesnitch=names["LITTLESNITCH"], backup_dir=Path(names["BACKUP_DIR"]),
+        owner_default=names["OWNER_DEFAULT"],
+        program_path=tuple(d for d in names["PROGRAM_PATH"].split(":") if d),
+        quiet=_flag(names["QUIET"], "QUIET", where), vrb=_flag(names["VRB"], "VRB", where),
+        dbg=_flag(names["DBG"], "DBG", where))
+
+
+# --- 2. littlesnitch ---------------------------------------------------------
+
+Rule = Dict[str, object]
+COUNTERS: Final = ("useCount", "lastUsed")
+
+
+def littlesnitch(s: Settings, *args: str, timeout: float = 300) -> str:
+    """One littlesnitch call; its stdout. Its two refusals become one line
+    each that says what to do."""
+    cmd = [s.littlesnitch, *args]
+    OUT.det(f" >>> {shlex.join(cmd)}")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        err("00011", f"Little Snitch's command line tool is not at {s.littlesnitch} (LITTLESNITCH in the config)")
+    except subprocess.TimeoutExpired:
+        err("00012", f"littlesnitch {args[0]} gave no answer within {timeout:.0f}s")
+    said = (r.stdout + r.stderr).strip()
+    if "not authorized" in said:
+        err("00013", "Little Snitch refuses its command line tool -- switch on "
+                     "Little Snitch > Settings > Security > \"Allow access via Terminal\"")
+    if "must be run as root" in said:
+        err("00014", f"littlesnitch needs root -- rerun as root: {SCRIPT_NAME} {shlex.join(sys.argv[1:])}")
+    if r.returncode != 0:
+        err("00015", f"littlesnitch {args[0]} failed [rc {r.returncode}]: {said[:300]}")
+    return r.stdout
+
+
+def export_model(s: Settings, dest: Path) -> Dict[str, object]:
+    """The whole model, through a file only root reads."""
+    littlesnitch(s, "export-model", str(dest))
+    try:
+        data = json.loads(dest.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        err("00016", f"the export {dest} is no JSON model: {e}")
+    if not isinstance(data, dict) or not isinstance(cast(Dict[str, object], data).get("rules"), list):
+        err("00017", f"the export {dest} has no 'rules' list -- has Little Snitch changed its format?")
+    return cast(Dict[str, object], data)
+
+
+def rules_of(model: Dict[str, object]) -> List[Rule]:
+    return cast(List[Rule], model["rules"])
+
+
+def rule_key(r: Rule) -> str:
+    """The rule without what Little Snitch counts by itself."""
+    return json.dumps({k: v for k, v in r.items() if k not in COUNTERS}, sort_keys=True)
+
+
+def rule_id(r: Rule) -> str:
+    """6 hex: the same from one export to the next, since a rule has no id of its own."""
+    return hashlib.sha256(rule_key(r).encode()).hexdigest()[:6]
+
+
+SAME_FIELDS: Final = ("action", "process", "via", "direction", "remote", "remote-domains", "remote-hosts",
+                      "remote-addresses", "ports", "protocol", "uid", "owner", "disabled")
+
+
+def rule_meaning(r: Rule) -> str:
+    """What a rule decides -- two rules with the same meaning are one rule twice."""
+    return json.dumps({k: r.get(k) for k in SAME_FIELDS}, sort_keys=True)
+
+
+def show_process(r: Rule) -> str:
+    p = r.get("process")
+    if p is None:
+        return "any"
+    text = str(p)
+    for prefix, shown in (("path.", "/"), ("script.", "script /"), ("identifier.", "")):
+        if text.startswith(prefix):
+            return shown + text[len(prefix):]
+    return text
+
+
+def show_remote(r: Rule) -> str:
+    for key in ("remote-domains", "remote-hosts", "remote-addresses"):
+        if key in r:
+            return str(r[key])
+    return str(r.get("remote", "any"))
+
+
+def show_port(r: Rule) -> str:
+    proto, port = r.get("protocol"), r.get("ports")
+    if proto is None and port is None:
+        return "any"
+    return f"{proto or 'any'}/{port or 'any'}"
+
+
+def show_owner(r: Rule) -> str:
+    if r.get("owner") == "system":
+        return "system"
+    uid = r.get("uid")
+    if uid is None:
+        return "anyone"
+    try:
+        return pwd.getpwuid(int(str(uid))).pw_name
+    except (KeyError, ValueError):
+        return f"uid {uid}"
+
+
+_VERSION_DIR: Final = re.compile(r"/Cellar/[^/]+/\d[^/]*/")
+
+
+def program_paths(r: Rule) -> List[str]:
+    """The file(s) a rule names on disk -- none for any process or a code identity."""
+    p = str(r.get("process", ""))
+    for prefix in ("path.", "script."):
+        if p.startswith(prefix):
+            return ["/" + p[len(prefix):].lstrip("/")]
+    return [p] if p.startswith("/") else []
+
+
+def verdict(r: Rule) -> str:
+    """The last column of `list`: <action>?[<reason>], or nothing to do."""
+    for path in program_paths(r):
+        if not (glob.glob(path) if "*" in path else os.path.lexists(path)):
+            return "cleanup?[program-gone]"
+    uid = r.get("uid")
+    if uid is not None:
+        try:
+            pwd.getpwuid(int(str(uid)))
+        except (KeyError, ValueError):
+            return "cleanup?[user-gone]"
+    if r.get("action") == "suggestion":
+        return "cleanup?[expired]"
+    if any(_VERSION_DIR.search(path) for path in program_paths(r)):
+        return "allow?[version-path]"
+    return ""
+
+
+def rule_line(r: Rule) -> str:
+    """ID, a TAB (so `cut -f 1` takes it), then the rule; the verdict last."""
+    action = str(r.get("action", "?")) + (" (off)" if r.get("disabled") else "")
+    direction = "in " if r.get("direction") == "incoming" else ""
+    cols = f"{show_process(r)}  {direction}{action}  {show_remote(r)}  {show_port(r)}  {show_owner(r)}"
+    v = verdict(r)
+    return f"{rule_id(r)}\t{cols}" + (f"   {v}" if v else "")
+
+
+# --- 3. programs -------------------------------------------------------------
+
+_CELLAR: Final = re.compile(r"^(?P<pre>.*/Cellar/)(?P<formula>[^/@]+)(?P<at>@[^/]+)?/(?P<ver>[^/]+)/(?P<rest>.*)$")
+_PY_BIN: Final = re.compile(r"^(?P<fw>.*/Python\.framework/Versions/[^/]+)/bin/python[0-9.]*$")
+
+
+@dataclass(frozen=True)
+class Program:
+    """A program as a rule names it: the `process` value, what was asked, and
+    what was done to the path on the way."""
+
+    process: Optional[str]          # None: any process
+    asked: str
+    path: str
+    note: str
+
+
+def find_program(s: Settings, asked: str) -> Program:
+    """`any`, a path (a '*' in it taken as written), or a bare name looked up
+    on $PATH and PROGRAM_PATH. A Homebrew one becomes its version-free form, as
+    Little Snitch's own alert writes it: Cellar/<formula>@*/*/..., and a
+    Python's real program, Python.app, which is what connects."""
+    if asked == "any":
+        return Program(None, asked, "", "")
+    if "*" in asked:
+        if not asked.startswith("/"):
+            err("00018", f"'{asked}': a pattern must be a full path")
+        if not glob.glob(asked):
+            err("00019", f"'{asked}' matches no file")
+        return Program("path." + asked[1:], asked, asked, "")
+    if "/" in asked:
+        found = asked
+    else:
+        dirs = os.environ.get("PATH", "").split(":") + list(s.program_path)
+        hit = shutil.which(asked, path=":".join(d for d in dirs if d))
+        if hit is None:
+            err("00020", f"no program '{asked}' on $PATH or PROGRAM_PATH -- give its full path")
+        found = hit
+    if not os.path.exists(found):
+        err("00021", f"'{found}' does not exist")
+    real = os.path.realpath(found)
+    notes: List[str] = []
+    py = _PY_BIN.match(real)
+    if py:
+        real = py.group("fw") + "/Resources/Python.app/Contents/MacOS/Python"
+        notes.append("a Python connects as its Python.app")
+    m = _CELLAR.match(real)
+    if m:
+        rest = re.sub(r"/Versions/[^/]+/", "/Versions/*/", "/" + m.group("rest"))[1:]
+        real = f"{m.group('pre')}{m.group('formula')}{'@*' if m.group('at') else ''}/*/{rest}"
+        notes.append("the version parts made '*', so upgrades keep the rule")
+    via = f"from {asked}" + (f" = {found}" if found != asked else "")
+    return Program("path." + real.lstrip("/"), asked, "/" + real.lstrip("/"), f"({via}: {'; '.join(notes)})" if notes else "")
+
+
+def find_owner(s: Settings, given: Optional[str]) -> Tuple[Rule, str]:
+    """The owner fields of a new rule, and how to show them."""
+    owner = given or s.owner_default
+    if not owner:
+        err("00022", "whose rule? --owner <USER>|anyone|system (or OWNER_DEFAULT in the config)")
+    if owner == "anyone":
+        return {}, "anyone"
+    if owner == "system":
+        return {"owner": "system"}, "system"
+    try:
+        return {"uid": pwd.getpwnam(owner).pw_uid}, owner
+    except KeyError:
+        err("00023", f"--owner '{owner}': no such user here (a user, anyone or system)")
+
+
+# --- 4. changing the model -----------------------------------------------------
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+@contextlib.contextmanager
+def locked(s: Settings) -> Generator[None, None, None]:
+    """One change at a time: an atomic mkdir, the owner's pid inside. A dead
+    owner's lock is broken, and said; a live one is never waited for."""
+    lock = s.backup_dir / "lock"
+    while True:
+        try:
+            lock.mkdir()
+            break
+        except FileExistsError:
+            try:
+                owner = (lock / "owner").read_text(encoding="utf-8").strip()
+            except OSError:
+                owner = ""
+            m = re.match(r"pid=(\d+)", owner)
+            if m is None or _alive(int(m.group(1))):
+                err("00024", f"another {SCRIPT_NAME} is changing the rules ({owner or 'owner not yet written'}): "
+                             f"{lock} -- run again when it is done")
+            OUT.msg(f" >>> breaking a stale lock: its owner is gone ({owner})")
+            with contextlib.suppress(OSError):
+                (lock / "owner").unlink()
+            with contextlib.suppress(OSError):
+                lock.rmdir()
+    try:
+        (lock / "owner").write_text(f"pid={os.getpid()} at={datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n",
+                                    encoding="utf-8")
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            (lock / "owner").unlink()
+        with contextlib.suppress(OSError):
+            lock.rmdir()
+
+
+def prepare_dir(s: Settings) -> None:
+    try:
+        s.backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(s.backup_dir, 0o700)
+    except OSError as e:
+        err("00025", f"cannot make BACKUP_DIR {s.backup_dir}: {e.strerror}")
+
+
+ROUNDTRIP_OK: Final = "roundtrip.ok"
+
+
+def change_model(s: Settings, change: Callable[[List[Rule]], List[Rule]], expect: Callable[[List[Rule]], List[str]],
+                 roundtrip: bool = False) -> Path:
+    """Export (the backup), change a copy, export again and refuse if a rule
+    moved meanwhile, restore, export and check the change is all that
+    changed. NOT atomic: a rule Little Snitch makes during the restore call
+    itself is lost -- the backup is the remedy. Returns the backup."""
+    prepare_dir(s)
+    if not roundtrip and not (s.backup_dir / ROUNDTRIP_OK).is_file():
+        err("00026", f"no change before '{SCRIPT_NAME} diag roundtrip go' has passed on this machine: "
+                     "it proves a restore loses nothing")
+    with locked(s):
+        backup = s.backup_dir / f"{datetime.datetime.now():%Y-%m-%d_%H%M%S}.json"
+        phase("exporting the rules (the backup)")
+        model = export_model(s, backup)
+        os.chmod(backup, 0o600)
+        OUT.det(f"    > backup: {backup}")
+        before = rules_of(model)
+        after = change([dict(r) for r in before])
+        model["rules"] = after
+        new = s.backup_dir / f".{SCRIPT_NAME}.{os.getpid()}.new.json"
+        check = s.backup_dir / f".{SCRIPT_NAME}.{os.getpid()}.check.json"
+        try:
+            new.write_text(json.dumps(model), encoding="utf-8")
+            os.chmod(new, 0o600)
+            phase("exporting again, to see whether a rule moved meanwhile")
+            again = rules_of(export_model(s, check))
+            if [rule_key(r) for r in again] != [rule_key(r) for r in before]:
+                err("00027", "a rule changed in Little Snitch while this run prepared its change -- "
+                             "nothing restored; run it again")
+            phase("restoring the changed rules")
+            littlesnitch(s, "restore-model", "-t", str(new))
+            phase("exporting once more, to check the change")
+            now = rules_of(export_model(s, check))
+            wrong = expect(now)
+            if wrong:
+                err("00028", "after the restore the rules are not what was asked: " + "; ".join(wrong[:5])
+                             + f" -- the rules before are in {backup}; as root: "
+                             + shlex.join([s.littlesnitch, "restore-model", "-t", str(backup)]))
+        finally:
+            for p in (new, check):
+                with contextlib.suppress(OSError):
+                    p.unlink()
+    return backup
+
+
+def expect_rules(want: List[Rule]) -> Callable[[List[Rule]], List[str]]:
+    """The check after a restore: the same rules as `want`, by meaning; the
+    dates and counters are Little Snitch's to keep."""
+    def check(now: List[Rule]) -> List[str]:
+        have = sorted(rule_meaning(r) for r in now)
+        asked = sorted(rule_meaning(r) for r in want)
+        if have == asked:
+            return []
+        missing = [m for m in asked if m not in have]
+        extra = [m for m in have if m not in asked]
+        return [f"missing {m}" for m in missing] + [f"unexpected {m}" for m in extra] or ["the counts differ"]
+    return check
+
+
+# --- 5. commands -------------------------------------------------------------
+
+def load_rules(s: Settings) -> List[Rule]:
+    prepare_dir(s)
+    phase("exporting the rules")
+    tmp = s.backup_dir / f".{SCRIPT_NAME}.{os.getpid()}.list.json"
+    try:
+        return rules_of(export_model(s, tmp))
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def cmd_list(s: Settings, args: Sequence[str]) -> int:
+    if len(args) > 1:
+        err("00029", "list takes one <FILTER> at most")
+    rules = load_rules(s)
+    shown = [line for line in (rule_line(r) for r in rules) if not args or args[0] in line]
+    for line in shown:
+        OUT.result(line)
+    todo = sum(1 for line in shown if "cleanup?[" in line)
+    OUT.msg(f" >>> {len(shown)} of {len(rules)} rule(s)" + (f"; {todo} outdated -- '{SCRIPT_NAME} cleanup' shows them" if todo else ""))
+    return 0
+
+
+@dataclass
+class RuleArgs:
+    go: bool = False
+    process: str = ""
+    remote: str = ""
+    port: str = "443"
+    host: bool = False
+    owner: Optional[str] = None
+
+
+def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
+    a = RuleArgs()
+    rest: List[str] = []
+    it = iter(args)
+    for x in it:
+        key, eq, val = x.partition("=")
+        if key in ("--port", "--owner"):
+            v = val if eq else next(it, None)
+            if not v:
+                err("00030", f"{key} needs a value")
+            if key == "--port":
+                if v != "any" and not re.fullmatch(r"\d+(-\d+)?", v):
+                    err("00031", f"--port '{v}': a number, a range like 6881-6889, or any")
+                a.port = v
+            else:
+                a.owner = v
+        elif x == "--host":
+            a.host = True
+        elif x.startswith("-"):
+            err("00032", f"no such option for {verb}: '{x}' ({SCRIPT_NAME} --help)")
+        else:
+            rest.append(x)
+    if rest[:1] == ["go"]:
+        a.go = True
+        rest = rest[1:]
+    if len(rest) != 2:
+        err("00033", f"{verb} [go] <PROCESS> <REMOTE> -- e.g. {SCRIPT_NAME} {verb} aria2c any")
+    a.process, a.remote = rest
+    return a
+
+
+def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, str]:
+    prog = find_program(s, a.process)
+    owner_fields, owner_shown = find_owner(s, a.owner)
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r: Rule = {"action": action}
+    if prog.process is not None:
+        r["process"] = prog.process
+    if a.remote == "any":
+        r["remote"] = "any"
+    else:
+        r["remote-hosts" if a.host else "remote-domains"] = a.remote
+    if a.port != "any":
+        r["ports"], r["protocol"] = a.port, "tcp"
+    r.update(owner_fields)
+    r.update({"origin": "frontend", "creationDate": now, "modificationDate": now})
+    return r, prog, owner_shown
+
+
+def cmd_add(s: Settings, action: str, args: Sequence[str]) -> int:
+    a = parse_rule_args(action, args)
+    r, prog, _ = new_rule(s, action, a)
+    if prog.process is not None:
+        OUT.msg(f" >>> process: {prog.process}")
+        if prog.note:
+            OUT.msg(f"    > {prog.note}")
+    rules = load_rules(s)
+    same = [x for x in rules if rule_meaning(x) == rule_meaning(r)]
+    if same:
+        OUT.msg(f" >>> already there: {rule_line(same[0])}")
+        return 0
+    shown = rule_line(r).split("\t", 1)[1]
+    if not a.go:
+        OUT.msg(f" >>> would add: {shown}")
+        OUT.msg(f"    > '{SCRIPT_NAME} {action} go {shlex.join(args)}' adds it")
+        return 0
+    want = rules + [r]
+    backup = change_model(s, lambda now: now + [r], expect_rules(want))
+    OUT.msg(f" >>> added: {shown}  [rules {len(rules)} -> {len(want)}]")
+    OUT.det(f"    > the rules before: {backup}")
+    return 0
+
+
+def ids_from(args: Sequence[str]) -> List[str]:
+    """IDs as arguments, else one per line on stdin -- the first word of a
+    `list` line is enough."""
+    if args:
+        return list(args)
+    if sys.stdin.isatty():
+        return []
+    phase("reading the IDs on stdin")
+    return [line.split()[0] for line in sys.stdin.read().splitlines() if line.strip()]
+
+
+def remove_rules(s: Settings, verb: str, go: bool, pick: Callable[[List[Rule]], List[Rule]]) -> int:
+    rules = load_rules(s)
+    chosen = pick(rules)
+    for r in chosen:
+        OUT.result(rule_line(r))
+    if not chosen:
+        OUT.msg(" >>> nothing to remove")
+        return 0
+    if not go:
+        OUT.msg(f" >>> {len(chosen)} rule(s) would be removed -- '{SCRIPT_NAME} {verb} go' removes them")
+        return 0
+    gone = {rule_key(r) for r in chosen}
+    keep = [r for r in rules if rule_key(r) not in gone]
+    change_model(s, lambda now: [r for r in now if rule_key(r) not in gone], expect_rules(keep))
+    OUT.msg(f" >>> removed {len(chosen)} rule(s)  [rules {len(rules)} -> {len(keep)}]")
+    return 0
+
+
+def cmd_remove(s: Settings, args: Sequence[str]) -> int:
+    go = args[:1] == ["go"]
+    ids = ids_from(args[1:] if go else args)
+    if not ids:
+        err("00034", f"remove [go] <ID>.. -- or the IDs on stdin: {SCRIPT_NAME} list x | cut -f 1 | {SCRIPT_NAME} remove")
+    bad = [i for i in ids if not re.fullmatch(r"[0-9a-f]{6}", i)]
+    if bad:
+        err("00035", f"not an ID (6 hex digits, the first column of 'list'): {' '.join(bad[:5])}")
+
+    def pick(rules: List[Rule]) -> List[Rule]:
+        by_id = {rule_id(r): r for r in rules}
+        unknown = [i for i in ids if i not in by_id]
+        if unknown:
+            err("00036", f"no rule with ID {' '.join(unknown[:5])} -- 'list' again: a changed rule has a new ID")
+        return [by_id[i] for i in dict.fromkeys(ids)]
+
+    return remove_rules(s, "remove", go, pick)
+
+
+def cmd_cleanup(s: Settings, args: Sequence[str]) -> int:
+    if args not in ([], ["go"]):
+        err("00037", "cleanup [go] -- it takes nothing else")
+    return remove_rules(s, "cleanup", args == ["go"], lambda rules: [r for r in rules if verdict(r).startswith("cleanup?")])
+
+
+_SINCE: Final = re.compile(r"(\d+)([mhd])$")
+
+
+def since_of(text: str) -> datetime.datetime:
+    m = _SINCE.match(text)
+    if m is None:
+        err("00038", f"--since '{text}': a number and m, h or d (30m, 1h, 2d)")
+    unit = {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    return datetime.datetime.now() - datetime.timedelta(seconds=int(m.group(1)) * unit)
+
+
+PROTOCOLS: Final = {"6": "tcp", "17": "udp", "1": "icmp", "58": "icmp6"}
+
+
+def traffic_line(row: Dict[str, str], wide: bool) -> str:
+    when = datetime.datetime.strptime(row["date"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).astimezone()
+    exe = row.get("connectingExecutable", "")
+    prog = exe if wide else (os.path.basename(exe) or "?")
+    remote = row.get("remoteHostname") or row.get("ipAddress", "?")
+    n = int(row.get("connectCount") or 0)
+    denied = int(row.get("denyCount") or 0)
+    line = (f"{when:%Y-%m-%d %H:%M:%S}  {row.get('direction', '?'):<3}  {prog}  {remote}  "
+            f"{PROTOCOLS.get(row.get('protocol', ''), row.get('protocol', '?'))}/{row.get('port', '?')}  "
+            f"{n} connect{'s' if n != 1 else ''}" + (f"  DENIED {denied}" if denied else ""))
+    if wide:
+        line += f"  in {row.get('byteCountIn', '0')} B out {row.get('byteCountOut', '0')} B"
+    return line
+
+
+def cmd_log(s: Settings, args: Sequence[str]) -> int:
+    since, denied, what = "1h", False, None
+    it = iter(args)
+    for x in it:
+        key, eq, val = x.partition("=")
+        if key == "--since":
+            v = val if eq else next(it, None)
+            if not v:
+                err("00039", "--since needs a time: 30m, 1h, 2d")
+            since = v
+        elif x == "--denied":
+            denied = True
+        elif x.startswith("-"):
+            err("00040", f"no such option for log: '{x}' ({SCRIPT_NAME} --help)")
+        elif what is None:
+            what = x
+        else:
+            err("00041", "log [<PROCESS>|<FILTER>] [--since 1h] [--denied] -- one PROCESS or FILTER")
+    start = since_of(since)
+    pattern: Optional[str] = None
+    if what is not None and ("/" in what or shutil.which(what, path=":".join(
+            os.environ.get("PATH", "").split(":") + list(s.program_path)))):
+        prog = find_program(s, what)
+        pattern = prog.path
+        OUT.det(f" >>> {what} = {pattern}")
+    cmd = [s.littlesnitch, "log-traffic", "-b", f"{start:%Y-%m-%d %H:%M:%S}"]
+    OUT.det(f" >>> {shlex.join(cmd)}")
+    phase("reading the traffic log")
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        err("00042", f"Little Snitch's command line tool is not at {s.littlesnitch} (LITTLESNITCH in the config)")
+    assert p.stdout is not None and p.stderr is not None, "both pipes were asked for"
+    shown = seen = 0
+    first = p.stdout.readline()
+    if first.startswith("date,"):
+        for row in csv.DictReader(p.stdout, fieldnames=next(csv.reader([first]))):
+            seen += 1
+            exe = row.get("connectingExecutable") or ""
+            parent = row.get("parentAppExecutable") or ""
+            if pattern is not None and not (fnmatch.fnmatchcase(exe, pattern) or fnmatch.fnmatchcase(parent, pattern)):
+                continue
+            if denied and not int(row.get("denyCount") or 0):
+                continue
+            line = traffic_line(row, OUT.vrb)
+            if pattern is None and what is not None and what not in line:
+                continue
+            shown += 1
+            OUT.result(line)
+    rest = first + p.stdout.read() if not first.startswith("date,") else ""
+    errs = p.stderr.read()
+    rc = p.wait()
+    said = (rest + errs).strip()
+    if "not authorized" in said:
+        err("00043", "Little Snitch refuses its command line tool -- switch on "
+                     "Little Snitch > Settings > Security > \"Allow access via Terminal\"")
+    if rc != 0:
+        err("00044", f"littlesnitch log-traffic failed [rc {rc}]: {said[:300]}")
+    which = f"{what} = {pattern}" if pattern else (f"lines holding '{what}'" if what else "everything")
+    OUT.msg(f" >>> {shown} of {seen} line(s) since {start:%Y-%m-%d %H:%M}: {which}" + (", denied only" if denied else ""))
+    return 0
+
+
+def cmd_diag(s: Settings, args: Sequence[str]) -> int:
+    if args[:1] == ["events"]:
+        since = "10m"
+        rest = list(args[1:])
+        if rest[:1] == ["--since"] and len(rest) == 2:
+            since = rest[1]
+        elif rest:
+            err("00045", "diag events [--since 10m]")
+        since_of(since)
+        OUT.result(littlesnitch(s, "log", "-l", since).rstrip("\n"))
+        return 0
+    if args[:1] == ["roundtrip"] and args[1:] in ([], ["go"]):
+        rules = load_rules(s)
+        if args[1:] != ["go"]:
+            OUT.msg(f" >>> would export the {len(rules)} rules, restore them unchanged and compare -- "
+                    f"'{SCRIPT_NAME} diag roundtrip go' does it")
+            return 0
+        backup = change_model(s, lambda now: now, expect_rules(rules), roundtrip=True)
+        (s.backup_dir / ROUNDTRIP_OK).write_text(
+            f"passed {datetime.datetime.now():%Y-%m-%d %H:%M:%S}, {littlesnitch(s, '-v').strip()}, "
+            f"{len(rules)} rules, backup {backup}\n", encoding="utf-8")
+        OUT.msg(f" >>> roundtrip passed: {len(rules)} rules restored unchanged [backup {backup}]")
+        return 0
+    err("00046", "diag roundtrip [go] | diag events [--since 10m]")
+
+
+def version_line() -> str:
+    """The exact build: the version; git's describe where this file is tracked
+    in its OWN repository (else the stamped commit); the hash of the bytes."""
+    me = Path(os.path.realpath(__file__))
+    build = hashlib.sha256(me.read_bytes()).hexdigest()[:12]
+    desc = SCRIPT_COMMIT
+
+    def git(*a: str) -> str:
+        r = subprocess.run(["git", "-C", str(me.parent), *a], capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    try:
+        if git("remote", "get-url", "origin").endswith((REPOSITORY, REPOSITORY + ".git")) \
+                and git("ls-files", me.name) == me.name:
+            desc = git("describe", "--tags", "--long", "--always", "--dirty") or desc
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return f"{SCRIPT_NAME} {SCRIPT_VERSION} ({desc}, build {build})"
+
+
+HELP: Final = f"""\
+usage: {SCRIPT_NAME} [OPTIONS] <COMMAND> [<ARGS>]
+
+Little Snitch's rules and traffic from the command line. Root only, and
+Little Snitch > Settings > Security > "Allow access via Terminal" on.
+
+RULES
+  list [<FILTER>]      one line per rule: an ID, a TAB, then process,
+                       action, remote, protocol/port, owner -- and, where
+                       there is something to do, what:
+                         cleanup?[program-gone]  the program no longer exists
+                         cleanup?[user-gone]     its owner is no user here
+                         cleanup?[expired]       an expired temporary rule
+                         allow?[version-path]    works, but breaks on the next
+                                                 upgrade: allow its program again
+                       FILTER: a part of the line
+  allow [go] <PROCESS> <REMOTE> [--port <N>|any] [--host] [--owner <USER>|anyone|system]
+  deny  [go] <PROCESS> <REMOTE> ...
+                       shows the outgoing rule it would add; with go, adds it
+                       (one already there is said, not doubled).
+                         PROCESS  any, a path ('*' allowed), or a name found
+                                  on $PATH (aria2c). A Homebrew program gets
+                                  '*' for its version parts -- and a Python
+                                  is its Python.app -- so upgrades keep the rule
+                         REMOTE   a domain (and its hosts), a host with
+                                  --host, or any
+                         --port   default 443 (tcp); --owner default
+                                  OWNER_DEFAULT
+  remove [go] [<ID>..] shows the rules; with go, removes them. IDs as
+                       arguments or one per line on stdin:
+                         {SCRIPT_NAME} list python@3.10 | cut -f 1 | {SCRIPT_NAME} remove go
+  cleanup [go]         the OUTDATED rules -- useless, since what they name
+                       no longer exists: every 'cleanup?' line of list.
+                       Shows them; with go, removes them
+
+  A change exports the rules (the backup, in BACKUP_DIR), exports again and
+  refuses if a rule moved meanwhile, restores, and checks the result. Not
+  atomic: a rule Little Snitch itself makes during the restore call is lost.
+  No change before 'diag roundtrip go' has passed on the machine.
+
+TRAFFIC
+  log [<PROCESS>|<FILTER>] [--since 1h] [--denied]
+                       the connections Little Snitch counted: local time,
+                       in/out, program, remote, protocol/port, connects,
+                       DENIED. A PROCESS (aria2c, a path) matches all its
+                       versions; anything else is a part of the line
+
+ADMIN
+  diag roundtrip [go]  export, restore unchanged, compare -- needed once
+  diag events [--since 10m]   Little Snitch's own messages
+
+OPTIONS
+  -Q, --quiet              nothing on the terminal but results and errors
+  -V, --verbose            also each littlesnitch call, the backup, the
+                           full program path and bytes in the log
+  -D, --debug              also the diagnostics (~~~); implies -V
+  --config <FILE>          read FILE instead of searching for one
+  --create-config [<FILE>] the default config, to stdout or into a new FILE
+  --run-tests [<FILTER>]   the built-in tests (TAP)
+  --version                the exact build
+  -h, --help               this
+
+CONFIG  KEY="value" lines, read and never run -- the first found of
+  $MY_LITTLE_SNITCH_CONFIG, --config <FILE>,
+  {', '.join(str(p).replace(str(Path.home()), "~", 1) for p in config_search_paths())}
+
+EXAMPLES
+  {SCRIPT_NAME} allow /opt/homebrew/bin/python3 api.example.org
+  {SCRIPT_NAME} log aria2c --since 1d --denied
+  {SCRIPT_NAME} cleanup go"""
+
+COMMANDS: Final = ("list", "allow", "deny", "remove", "cleanup", "log", "diag", "help")
+
+
+@dataclass
+class Cli:
+    command: Optional[str] = None
+    args: List[str] = field(default_factory=lambda: [])
+    quiet: Optional[bool] = None
+    vrb: Optional[bool] = None
+    dbg: Optional[bool] = None
+    config: Optional[str] = None
+
+
+def parse_cli(argv: Sequence[str]) -> Cli:
+    """The global options anywhere; the rest belongs to the command."""
+    c = Cli()
+    it = iter(argv)
+    for a in it:
+        key, eq, val = a.partition("=")
+        if a in ("-Q", "--quiet"):
+            c.quiet = True
+        elif a in ("-V", "--verbose"):
+            c.vrb = True
+        elif a in ("-D", "--debug"):
+            c.dbg = True
+        elif key == "--config":
+            v = val if eq else next(it, None)
+            if not v:
+                err("00047", "--config needs a <FILE>")
+            c.config = v
+        elif a in ("-h", "--help"):
+            c.command = "help"
+        elif c.command is None:
+            if a.startswith("-"):
+                verb = a.lstrip("-")
+                hint = f" -- you mean `{SCRIPT_NAME} {verb}`" if verb in COMMANDS else f" ({SCRIPT_NAME} --help)"
+                err("00048", f"no such option '{a}'{hint}")
+            if a not in COMMANDS:
+                err("00049", f"'{a}' is no command ({SCRIPT_NAME} --help)")
+            c.command = a
+        else:
+            c.args.append(a)
+    return c
+
+
+def create_config(target: Optional[str]) -> int:
+    if target is None:
+        sys.stdout.write(DEFAULT_CONFIG)
+        return 0
+    p = Path(target)
+    try:
+        with p.open("x", encoding="utf-8") as f:
+            f.write(DEFAULT_CONFIG)
+    except FileExistsError:
+        err("00050", f"{p} exists -- never written over (compare it with `{SCRIPT_NAME} --create-config`)")
+    OUT.msg(f" >>> wrote the default config to {p}")
+    return 0
+
+
+_geteuid: Callable[[], int] = os.geteuid
+
+
+def run(argv: Sequence[str]) -> int:
+    first, _, value = (argv[0] if argv else "").partition("=")
+    if first == "--run-tests":
+        return run_tests(argv[1] if len(argv) > 1 else "")
+    if first == "--version":
+        OUT.result(version_line())
+        return 0
+    if first == "--create-config":
+        return create_config(value or (argv[1] if len(argv) > 1 else None))
+    c = parse_cli(argv)
+    if c.command in (None, "help"):
+        OUT.result(HELP)
+        return 0
+    if _geteuid() != 0:
+        err("00051", f"needs root -- littlesnitch refuses anyone else; as root: {SCRIPT_NAME} {shlex.join(argv)}")
+    s = load_settings(c.config)
+    OUT.dbg_on = c.dbg if c.dbg is not None else s.dbg
+    OUT.vrb = OUT.dbg_on or (c.vrb if c.vrb is not None else s.vrb)
+    OUT.quiet = (c.quiet if c.quiet is not None else s.quiet) and not OUT.vrb   # -V beats -Q
+    install_completion()
+    if c.command == "list":
+        return cmd_list(s, c.args)
+    if c.command in ("allow", "deny"):
+        return cmd_add(s, c.command, c.args)
+    if c.command == "remove":
+        return cmd_remove(s, c.args)
+    if c.command == "cleanup":
+        return cmd_cleanup(s, c.args)
+    if c.command == "log":
+        return cmd_log(s, c.args)
+    return cmd_diag(s, c.args)
+
+
+COMPLETION: Final = f"""#compdef {SCRIPT_NAME}
+# written by {SCRIPT_NAME} itself, on every run where it changed
+_{SCRIPT_NAME.replace('-', '_')}() {{
+  local -a cmds
+  cmds=(list:'one line per rule' allow:'add an allow rule' deny:'add a deny rule'
+        remove:'remove rules by ID' cleanup:'remove the outdated rules'
+        log:'the traffic Little Snitch counted' diag:'roundtrip, events')
+  if (( CURRENT == 2 )); then
+    _describe command cmds
+    _arguments '-Q[quiet]' '-V[verbose]' '-D[debug]' '--config[config file]:file:_files' \\
+      '--create-config[the default config]' '--run-tests[the built-in tests]' '--version[the exact build]'
+    return
+  fi
+  case $words[2] in
+    allow|deny) _arguments '*:argument:(go any)' '--port[port]:port:' '--host[REMOTE is one host]' \\
+                  '--owner[owner]:owner:(anyone system)' ;;
+    remove|cleanup) _values argument go ;;
+    log) _arguments '1:program:_command_names' '--since[since]:time:(30m 1h 6h 1d 7d)' '--denied[denied only]' ;;
+    diag) _values check roundtrip events ;;
+  esac
+}}
+_{SCRIPT_NAME.replace('-', '_')} "$@"
+"""
+
+
+_completion_on = True     # off in --run-tests: a test never writes into $HOME
+
+
+def install_completion() -> None:
+    """The zsh completion, written when it changed -- best effort, never fails a run."""
+    if not _completion_on:
+        return
+    try:
+        folder = Path.home() / ".zsh" / "completions"
+        target = folder / f"_{SCRIPT_NAME}"
+        if target.is_file() and target.read_text(encoding="utf-8") == COMPLETION:
+            return
+        folder.mkdir(parents=True, exist_ok=True)
+        tmp = folder / f".{target.name}.{os.getpid()}"
+        tmp.write_text(COMPLETION, encoding="utf-8")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, target)
+        for dump in Path.home().glob(".zcompdump*"):
+            dump.unlink()
+        zshrc = Path.home() / ".zshrc"
+        if zshrc.is_file() and ".zsh/completions" not in zshrc.read_text(encoding="utf-8"):
+            with zshrc.open("a", encoding="utf-8") as f:
+                f.write("\nfpath=(~/.zsh/completions $fpath); autoload -Uz compinit && compinit\n")
+        OUT.det(f"    > zsh completion written: {target}")
+    except OSError as e:
+        OUT.dbg(f"zsh completion not written: {e}")
+
+
+def trace_file() -> Path:
+    return Path(tempfile.gettempdir()) / f"{SCRIPT_NAME}.{datetime.datetime.now():%Y-%m-%d_%H%M%S}.{os.getpid()}.trace"
+
+
+def main(argv: Sequence[str]) -> int:
+    """Every way a run ends: 0; 1 with ONE error line; 130 on Ctrl-C; 70 and a
+    trace file on a bug -- never a traceback on the screen."""
+    try:
+        return run(argv)
+    except SnitchError as e:
+        OUT.error(f"ERROR {e.code} [1]: {e.text}")
+        return 1
+    except KeyboardInterrupt:
+        OUT.error(f"{SCRIPT_NAME}: interrupted (Ctrl-C) while {_phase} -- nothing restored after that point; "
+                  f"run it again")
+        return 130
+    except OSError as e:
+        OUT.error(f"ERROR 00052 [1]: while {_phase}: {e.strerror or e}" + (f": {e.filename}" if e.filename else ""))
+        return 1
+    except Exception as e:   # a bug: one line here, the trace in a file
+        where = trace_file()
+        try:
+            where.write_text(f"{version_line()}\nargv: {list(argv)}\n\n{traceback.format_exc()}", encoding="utf-8")
+        except OSError:
+            where = Path("(not written)")
+        OUT.error(f"ERROR 00053 [70]: unexpected {type(e).__name__} while {_phase} -- the trace: {where}")
+        return 70
+
+
+# --- --run-tests -----------------------------------------------------------
+# TAP: the plan first, then "ok K - name" / "not ok K - name" as each ends.
+# Little Snitch is a stub script keeping its model in a file; nothing real
+# is read or changed, and the tests run as any user.
+
+STUB: Final = r'''#!/usr/bin/env python3
+import json, os, sys, shutil
+d = os.path.dirname(os.path.abspath(__file__))
+model, n = os.path.join(d, "model.json"), os.path.join(d, "exports")
+cmd, args = sys.argv[1], sys.argv[2:]
+def mode(name):
+    return os.path.exists(os.path.join(d, name))
+if mode("unauthorized"):
+    print("Error: command line tool is not authorized to make changes."); sys.exit(1)
+if cmd == "-v":
+    print("Version 6.5"); sys.exit(0)
+if cmd == "export-model":
+    k = int(open(n).read()) + 1 if os.path.exists(n) else 1
+    open(n, "w").write(str(k))
+    m = json.load(open(model))
+    if mode("drift") and k == 2:
+        m["rules"].append({"action": "allow", "process": "path.drift"})
+    for r in m["rules"]:
+        r["useCount"] = r.get("useCount", 0) + k
+    json.dump(m, open(args[0], "w")); sys.exit(0)
+if cmd == "restore-model":
+    m = json.load(open(args[-1]))
+    if mode("lossy"):
+        m["rules"] = m["rules"][1:]
+    json.dump(m, open(model, "w")); open(os.path.join(d, "restored"), "a").write("x\n"); sys.exit(0)
+if cmd == "log-traffic":
+    sys.stdout.write(open(os.path.join(d, "traffic.csv")).read()); sys.exit(0)
+if cmd == "log":
+    print("Timestamp  Thread  Type  a Little Snitch event"); sys.exit(0)
+sys.exit(2)
+'''
+
+TRAFFIC: Final = """\
+date,direction,uid,ipAddress,remoteHostname,protocol,port,connectCount,denyCount,byteCountIn,byteCountOut,connectingExecutable,parentAppExecutable
+2026-10-22T00:41:07Z,out,501,1.2.3.4,files.example.org,6,443,3,0,100,200,"{cellar}/aria2/1.37.0/bin/aria2c",
+2026-10-22T00:41:09Z,out,501,1.2.3.5,dl3.example.org,6,443,1,1,0,0,"{cellar}/aria2/1.36.0/bin/aria2c",
+2026-10-22T00:42:00Z,out,501,1.2.3.6,updates.example.com,6,443,1,0,34,0,"/Applications/Player.app/Contents/MacOS/Player",
+"""
+
+
+class T:
+    """One test: its folder, a stub littlesnitch, what it found wrong."""
+
+    def __init__(self, folder: Path) -> None:
+        self.dir = folder
+        self.bad: List[str] = []
+        self.stub = folder / "littlesnitch"
+        self.stub.write_text(f"#!{sys.executable}\n" + STUB.split("\n", 1)[1], encoding="utf-8")
+        self.stub.chmod(0o755)
+        self.cellar = folder / "Cellar"
+        me = pwd.getpwuid(os.getuid())
+        self.user, self.uid = me.pw_name, me.pw_uid
+        prog = self.cellar / "aria2" / "1.37.0" / "bin" / "aria2c"
+        prog.parent.mkdir(parents=True)
+        prog.write_text("#!/bin/sh\n")
+        prog.chmod(0o755)
+        (folder / "bin").mkdir()
+        (folder / "bin" / "aria2c").symlink_to(prog)
+        (folder / "traffic.csv").write_text(TRAFFIC.format(cellar=self.cellar), encoding="utf-8")
+        self.model([
+            {"action": "allow", "process": "path." + str(prog)[1:], "remote-domains": "keep.org", "ports": "443",
+             "protocol": "tcp", "uid": self.uid},
+            {"action": "allow", "process": "path.usr/local/Cellar/python@3.10/*/bin/python3", "remote-domains": "pypi.org"},
+            {"action": "allow", "process": "identifier.APPLE/com.apple.curl", "remote": "any", "uid": 77777},
+            {"action": "suggestion", "process": "identifier.APPLE/com.apple.ssh", "remote": "any", "owner": "system"},
+            {"action": "deny", "remote": "any", "direction": "incoming"},
+        ])
+
+    def check(self, ok: bool, what: str) -> None:
+        if not ok:
+            self.bad.append(what)
+
+    def model(self, rules: List[Rule]) -> None:
+        (self.dir / "model.json").write_text(json.dumps({"rules": rules, "other": 1}), encoding="utf-8")
+
+    def rules(self) -> List[Rule]:
+        return rules_of(json.loads((self.dir / "model.json").read_text(encoding="utf-8")))
+
+    def mode(self, name: str) -> None:
+        (self.dir / name).write_text("1", encoding="utf-8")
+
+    def config(self, extra: str = "") -> Path:
+        p = self.dir / "conf"
+        p.write_text(f'LITTLESNITCH="{self.stub}"\nBACKUP_DIR="{self.dir}/state"\nOWNER_DEFAULT="{self.user}"\n'
+                     f'PROGRAM_PATH="{self.dir}/bin"\n' + extra, encoding="utf-8")
+        return p
+
+    def passed_roundtrip(self) -> None:
+        (self.dir / "state").mkdir(exist_ok=True)
+        (self.dir / "state" / ROUNDTRIP_OK).write_text("passed in the test\n", encoding="utf-8")
+
+    def run(self, argv: Sequence[str], stdin: str = "") -> Tuple[int, str, str]:
+        """The tool in-process, as root, from a shell: rc, stdout, stderr."""
+        out, errs = io.StringIO(), io.StringIO()
+        old_in, old_path = sys.stdin, os.environ.get("PATH", "")
+        sys.stdin = io.StringIO(stdin)
+        os.environ["PATH"] = f"{self.dir}/bin:/usr/bin:/bin"     # the test's aria2c, not this machine's
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(errs):
+                rc = main(["--config", str(self.config()), *argv])
+        finally:
+            sys.stdin, os.environ["PATH"] = old_in, old_path
+            OUT.__init__()
+        return rc, out.getvalue(), errs.getvalue()
+
+
+def t_list_verdicts(t: T) -> None:
+    rc, out, errs = t.run(["list"])
+    lines = out.splitlines()
+    t.check(rc == 0 and len(lines) == 5, f"one line per rule: {out}")
+    t.check(all(re.match(r"[0-9a-f]{6}\t", line) for line in lines), "an ID of 6 hex, then a TAB")
+    t.check("cleanup?[program-gone]" in lines[1], f"a rule whose program is gone: {lines[1]}")
+    t.check("cleanup?[user-gone]" in lines[2], f"a rule whose owner is no user: {lines[2]}")
+    t.check("cleanup?[expired]" in lines[3], f"an expired suggestion: {lines[3]}")
+    t.check("allow?[version-path]" in lines[0] and "cleanup?" not in lines[0], f"a version path: {lines[0]}")
+    t.check(lines[4].endswith(f"any  in deny  any  any  anyone"), f"any process, anyone, incoming: {lines[4]}")
+    t.check(" 3 outdated" in errs, f"the summary counts the outdated ones: {errs}")
+    _, out2, _ = t.run(["list"])
+    t.check([x.split("\t")[0] for x in out2.splitlines()] == [x.split("\t")[0] for x in lines],
+            "the IDs stay the same while Little Snitch's counters move")
+    _, out3, _ = t.run(["list", "pypi"])
+    t.check(out3.splitlines() == [lines[1]], f"a FILTER: {out3}")
+
+
+def t_allow_shows_then_go(t: T) -> None:
+    t.passed_roundtrip()
+    rc, _, errs = t.run(["allow", "aria2c", "example.org"])
+    t.check(rc == 0 and "would add:" in errs and len(t.rules()) == 5, f"without go nothing changes: {errs}")
+    t.check(f"path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c" in errs, f"the Homebrew version made '*': {errs}")
+    t.check("the version parts made '*'" in errs, "and it says so")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
+    new = t.rules()[-1]
+    t.check(rc == 0 and "added:" in errs and len(t.rules()) == 6, f"go adds it: {errs}")
+    t.check(new.get("remote-domains") == "example.org" and new.get("ports") == "443"
+            and new.get("protocol") == "tcp" and new.get("uid") == t.uid and "direction" not in new,
+            f"the rule as the alert writes it: {new}")
+    t.check(len(list((t.dir / "state").glob("*.json"))) == 1, "one backup per change")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 6, f"never doubled: {errs}")
+    rc, _, errs = t.run(["deny", "go", "any", "evil.example", "--owner", "anyone", "--port", "any"])
+    new = t.rules()[-1]
+    t.check(rc == 0 and "process" not in new and "uid" not in new and "ports" not in new and new["action"] == "deny",
+            f"any process, anyone, any port: {new} {errs}")
+
+
+def t_python_is_its_app(t: T) -> None:
+    fw = t.cellar / "python@3.15" / "3.15.0" / "Frameworks" / "Python.framework" / "Versions" / "3.15"
+    (fw / "bin").mkdir(parents=True)
+    app = fw / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+    app.parent.mkdir(parents=True)
+    app.write_text("x")
+    (fw / "bin" / "python3.15").write_text("x")
+    (fw / "bin" / "python3.15").chmod(0o755)
+    (t.dir / "bin" / "python3").symlink_to(fw / "bin" / "python3.15")
+    rc, _, errs = t.run(["allow", "python3", "example.org"])
+    want = f"path.{str(t.cellar)[1:]}/python@*/*/Frameworks/Python.framework/Versions/*/Resources/Python.app/Contents/MacOS/Python"
+    t.check(rc == 0 and want in errs, f"any Homebrew Python, as its Python.app: {errs}")
+
+
+def t_roundtrip_gate(t: T) -> None:
+    rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
+    t.check(rc == 1 and "diag roundtrip go" in errs and len(t.rules()) == 5, f"no change before the roundtrip: {errs}")
+    rc, _, errs = t.run(["diag", "roundtrip"])
+    t.check(rc == 0 and "would export" in errs and not (t.dir / "restored").exists(), f"roundtrip without go: {errs}")
+    rc, _, errs = t.run(["diag", "roundtrip", "go"])
+    t.check(rc == 0 and "roundtrip passed: 5 rules" in errs and (t.dir / "state" / ROUNDTRIP_OK).is_file(), errs)
+    rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
+    t.check(rc == 0 and len(t.rules()) == 6, f"after it, changes go through: {errs}")
+
+
+def t_refuse_if_changed(t: T) -> None:
+    t.passed_roundtrip()
+    t.mode("drift")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
+    t.check(rc == 1 and "ERROR 00027" in errs and not (t.dir / "restored").exists(),
+            f"a rule moved between the exports: nothing restored: {errs}")
+
+
+def t_verify_after_restore(t: T) -> None:
+    t.passed_roundtrip()
+    t.mode("lossy")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
+    t.check(rc == 1 and "ERROR 00028" in errs and "missing" in errs and "restore-model -t" in errs
+            and str(t.dir / "state") in errs, f"a lost rule is found, the backup named: {errs}")
+
+
+def t_remove_and_cleanup(t: T) -> None:
+    t.passed_roundtrip()
+    _, out, _ = t.run(["list", "pypi"])
+    rc, _, errs = t.run(["remove"], stdin=out)
+    t.check(rc == 0 and "would be removed" in errs and len(t.rules()) == 5, f"remove without go: {errs}")
+    rc, _, errs = t.run(["remove", "go"], stdin=out)
+    t.check(rc == 0 and len(t.rules()) == 4 and not any(r.get("remote-domains") == "pypi.org" for r in t.rules()),
+            f"the IDs on stdin, removed: {errs}")
+    rc, _, errs = t.run(["remove", "go", "abcdef"])
+    t.check(rc == 1 and "no rule with ID abcdef" in errs, errs)
+    rc, out, errs = t.run(["cleanup"])
+    t.check(rc == 0 and len(out.splitlines()) == 2 and len(t.rules()) == 4, f"cleanup shows the outdated: {out}")
+    _, listed, _ = t.run(["list"])
+    t.check([x for x in listed.splitlines() if "cleanup?" in x] == out.splitlines(),
+            "'cleanup?' in list = what cleanup removes")
+    rc, _, errs = t.run(["cleanup", "go"])
+    t.check(rc == 0 and len(t.rules()) == 2, f"cleanup go: {errs}")
+
+
+def t_log(t: T) -> None:
+    rc, out, _ = t.run(["log", "aria2c", "--since", "2d"])
+    lines = out.splitlines()
+    t.check(rc == 0 and len(lines) == 2 and all(" aria2c " in x for x in lines), f"every version of aria2c: {out}")
+    t.check("DENIED 1" in lines[1] and "DENIED" not in lines[0], f"denials shown: {out}")
+    local = datetime.datetime(2026, 10, 22, 0, 41, 7, tzinfo=datetime.timezone.utc).astimezone()
+    t.check(lines[0].startswith(f"{local:%Y-%m-%d %H:%M:%S}"), f"local time: {lines[0]}")
+    _, out, _ = t.run(["log", "--denied"])
+    t.check(len(out.splitlines()) == 1, f"--denied: {out}")
+    _, out, _ = t.run(["log", "updates"])
+    t.check(len(out.splitlines()) == 1 and "updates.example.com" in out, f"a FILTER: {out}")
+    _, out, _ = t.run(["-V", "log", "aria2c"])
+    t.check("in 100 B out 200 B" in out and str(t.cellar) in out, f"-V: bytes and the full path: {out}")
+
+
+def t_refusals(t: T) -> None:
+    global _geteuid
+    _geteuid = lambda: 501
+    try:
+        rc, _, errs = t.run(["list"])
+    finally:
+        _geteuid = lambda: 0
+    t.check(rc == 1 and "needs root" in errs, f"not root: {errs}")
+    t.mode("unauthorized")
+    rc, _, errs = t.run(["list"])
+    t.check(rc == 1 and "Allow access via Terminal" in errs and len(errs.strip().splitlines()) == 1, errs)
+    for argv, want in ((["--list"], "you mean `my-little-snitch list`"), (["lsit"], "'lsit' is no command"),
+                       (["allow", "x"], "allow [go] <PROCESS> <REMOTE>"), (["log", "--since", "1y"], "--since '1y'")):
+        rc, _, errs = t.run(argv)
+        t.check(rc == 1 and want in errs, f"{argv}: {errs}")
+
+
+def t_lock(t: T) -> None:
+    t.passed_roundtrip()
+    lock = t.dir / "state" / "lock"
+    lock.mkdir()
+    (lock / "owner").write_text(f"pid={os.getpid()} at=now\n")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
+    t.check(rc == 1 and "another my-little-snitch" in errs and len(t.rules()) == 5, f"a live lock: {errs}")
+    p = subprocess.Popen(["true"])
+    p.wait()
+    (lock / "owner").write_text(f"pid={p.pid} at=then\n")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
+    t.check(rc == 0 and "breaking a stale lock" in errs and len(t.rules()) == 6 and not lock.exists(), errs)
+
+
+def t_output_layers(t: T) -> None:
+    plain = t.run(["list"])
+    quiet = t.run(["-Q", "list"])
+    verbose = t.run(["-V", "list"])
+    t.check(plain[1] == quiet[1] == verbose[1] != "", "stdout: the same results in every layer")
+    t.check(plain[2] != "" and quiet[2] == "", f"-Q: nothing on the terminal: {quiet[2]!r}")
+    t.check(all(line in verbose[2] for line in plain[2].splitlines()) and len(verbose[2]) > len(plain[2]),
+            "-V adds to the default, never replaces it")
+
+
+def t_create_config(t: T) -> None:
+    out_io = io.StringIO()
+    with contextlib.redirect_stdout(out_io):
+        rc = main(["--create-config"])
+    t.check(rc == 0 and out_io.getvalue() == DEFAULT_CONFIG, "the default config to stdout")
+    target = t.dir / "new.conf"
+    with contextlib.redirect_stderr(io.StringIO()):
+        main(["--create-config", str(target)])
+        rc = main(["--create-config", str(target)])
+    t.check(rc == 1 and target.read_text() == DEFAULT_CONFIG, "an existing file is never written over")
+
+
+def t_ctrl_c(t: T) -> None:
+    """A REAL SIGINT while remove waits for IDs on stdin: rc 130, one line."""
+    env = dict(os.environ, MY_LITTLE_SNITCH_TEST_ROOT="1")
+    p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "--config", str(t.config()), "remove"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    time.sleep(2)
+    p.send_signal(signal.SIGINT)
+    out, errs = p.communicate(timeout=30)
+    t.check(p.returncode == 130, f"rc {p.returncode}: {errs}")
+    t.check("interrupted (Ctrl-C) while reading the IDs on stdin" in errs and "Traceback" not in errs, errs)
+    t.check(len(errs.strip().splitlines()) == 1 and out == "", f"one line: {errs!r}")
+
+
+def t_version(t: T) -> None:
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = main(["--version"])
+    build = hashlib.sha256(Path(os.path.realpath(__file__)).read_bytes()).hexdigest()[:12]
+    t.check(rc == 0 and out.getvalue().startswith(f"{SCRIPT_NAME} {SCRIPT_VERSION} (") and f"build {build})" in out.getvalue(),
+            out.getvalue())
+
+
+TESTS: Final[List[Callable[[T], None]]] = [
+    t_list_verdicts, t_allow_shows_then_go, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed,
+    t_verify_after_restore, t_remove_and_cleanup, t_log, t_refusals, t_lock, t_output_layers, t_create_config,
+    t_ctrl_c, t_version,
+]
+
+
+def run_tests(name_filter: str) -> int:
+    global _geteuid, _completion_on
+    defined = {n for n in globals() if re.fullmatch(r"t_[a-z0-9_]+", n)}
+    listed = {f.__name__ for f in TESTS}
+    if defined != listed:
+        print(f"Bail out! test functions and TESTS differ: {sorted(defined ^ listed)}")
+        return 1
+    chosen = [f for f in TESTS if name_filter in f.__name__]
+    print(f"1..{len(chosen)}", flush=True)
+    bad, home = 0, Path.cwd()
+    real_euid = _geteuid
+    for k, test in enumerate(chosen, 1):
+        with tempfile.TemporaryDirectory(prefix=f"{SCRIPT_NAME}-tests.") as d:
+            t = T(Path(d).resolve())
+            os.chdir(t.dir)
+            _geteuid = lambda: 0
+            _completion_on = False
+            try:
+                test(t)
+            except Exception as e:   # a test that crashes fails, and the next one runs
+                t.bad.append(f"crashed: {type(e).__name__}: {e}")
+                t.bad.extend(traceback.format_exc().splitlines())
+            finally:
+                _geteuid, _completion_on = real_euid, True
+                os.chdir(home)
+                OUT.__init__()
+        print(f"{'not ok' if t.bad else 'ok'} {k} - {test.__name__}", flush=True)
+        for b in t.bad:
+            print(f"#   {b}")
+        bad += bool(t.bad)
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    if os.environ.get("MY_LITTLE_SNITCH_TEST_ROOT") == "1":     # t_ctrl_c's child: a test run, not root
+        _geteuid = lambda: 0
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    sys.exit(main(sys.argv[1:]))
