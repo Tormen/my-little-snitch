@@ -394,6 +394,8 @@ def program_paths(r: Rule) -> List[str]:
 
 def verdict(r: Rule) -> str:
     """The last column of `list`: <action>?[<reason>], or nothing to do."""
+    if not all(star_matches(path) for path in program_paths(r)):
+        return "cleanup?[never-matches]"
     for path in program_paths(r):
         if not (glob.glob(path) if "*" in path else os.path.lexists(path)):
             return "cleanup?[program-gone]"
@@ -436,16 +438,31 @@ class Program:
     note: str
 
 
+_VERSION_STAR: Final = re.compile(r"/Cellar/[^/*]+/\*/[^*]*$")
+
+
+def star_matches(path: str) -> bool:
+    """Whether Little Snitch can match this path: it has no wildcards in
+    process paths but ONE, its own -- a '*' standing for the folder of
+    Homebrew's version, right after Cellar/<formula>/ (as its alert writes
+    it). A '*' anywhere else is stored by restore-model and never matches."""
+    return "*" not in path or _VERSION_STAR.search(path) is not None
+
+
 def find_program(s: Settings, asked: str) -> Program:
-    """`any`, a path (a '*' in it taken as written), or a bare name looked up
-    on $PATH and PROGRAM_PATH. A Homebrew one becomes its version-free form, as
-    Little Snitch's own alert writes it: Cellar/<formula>@*/*/..., and a
-    Python's real program, Python.app, which is what connects."""
+    """`any`, a path, or a bare name looked up on $PATH and PROGRAM_PATH. A
+    Homebrew one gets Little Snitch's own form -- its version folder as '*',
+    nothing else changed (a new python@3.16 is another program) -- and a
+    Python is its Python.app, which is what connects. A path given with a
+    '*' is taken only in that one place."""
     if asked == "any":
         return Program(None, asked, "", "")
     if "*" in asked:
         if not asked.startswith("/"):
             err("00018", f"'{asked}': a pattern must be a full path")
+        if not star_matches(asked):
+            err("00019", f"'{asked}': Little Snitch matches a '*' only as Homebrew's version folder "
+                         f"(/Cellar/<formula>/*/...) -- anywhere else it never matches")
         if not glob.glob(asked):
             err("00019", f"'{asked}' matches no file")
         return Program("path." + asked[1:], asked, asked, "")
@@ -467,9 +484,8 @@ def find_program(s: Settings, asked: str) -> Program:
         notes.append("a Python connects as its Python.app")
     m = _CELLAR.match(real)
     if m:
-        rest = re.sub(r"/Versions/[^/]+/", "/Versions/*/", "/" + m.group("rest"))[1:]
-        real = f"{m.group('pre')}{m.group('formula')}{'@*' if m.group('at') else ''}/*/{rest}"
-        notes.append("the version parts made '*', so upgrades keep the rule")
+        real = f"{m.group('pre')}{m.group('formula')}{m.group('at') or ''}/*/{m.group('rest')}"
+        notes.append("its version folder made '*', as Little Snitch's alert writes it, so upgrades keep the rule")
     via = f"from {asked}" + (f" = {found}" if found != asked else "")
     return Program("path." + real.lstrip("/"), asked, "/" + real.lstrip("/"), f"({via}: {'; '.join(notes)})" if notes else "")
 
@@ -709,6 +725,8 @@ def cmd_add(s: Settings, action: str, args: Sequence[str]) -> int:
     want = rules + [r]
     backup = change_model(s, lambda now: now + [r], expect_rules(want))
     OUT.msg(f" >>> added: {shown}  [rules {len(rules)} -> {len(want)}]")
+    OUT.msg(f"    > stored and read back -- proven only by a connection it lets through: "
+            f"{SCRIPT_NAME} log {shlex.quote(a.process)}")
     OUT.det(f"    > the rules before: {backup}")
     return 0
 
@@ -781,19 +799,29 @@ def since_of(text: str) -> datetime.datetime:
 PROTOCOLS: Final = {"6": "tcp", "17": "udp", "1": "icmp", "58": "icmp6"}
 
 
+def human_bytes(text: str) -> str:
+    n = float(text or 0)
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
 def traffic_line(row: Dict[str, str], wide: bool) -> str:
+    """One line per row of log-traffic. A row is a sample of a connection, so
+    its bytes say whether anything moved; `connects` counts only the new
+    connections in that sample, and is shown only when there were any."""
     when = datetime.datetime.strptime(row["date"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).astimezone()
     exe = row.get("connectingExecutable", "")
     prog = exe if wide else (os.path.basename(exe) or "?")
     remote = row.get("remoteHostname") or row.get("ipAddress", "?")
     n = int(row.get("connectCount") or 0)
     denied = int(row.get("denyCount") or 0)
-    line = (f"{when:%Y-%m-%d %H:%M:%S}  {row.get('direction', '?'):<3}  {prog}  {remote}  "
+    return (f"{when:%Y-%m-%d %H:%M:%S}  {row.get('direction', '?'):<3}  {prog}  {remote}  "
             f"{PROTOCOLS.get(row.get('protocol', ''), row.get('protocol', '?'))}/{row.get('port', '?')}  "
-            f"{n} connect{'s' if n != 1 else ''}" + (f"  DENIED {denied}" if denied else ""))
-    if wide:
-        line += f"  in {row.get('byteCountIn', '0')} B out {row.get('byteCountOut', '0')} B"
-    return line
+            f"in {human_bytes(row.get('byteCountIn', '0'))} out {human_bytes(row.get('byteCountOut', '0'))}"
+            + (f"  {n} connect{'s' if n != 1 else ''}" if n else "") + (f"  DENIED {denied}" if denied else ""))
 
 
 def cmd_log(s: Settings, args: Sequence[str]) -> int:
@@ -915,6 +943,7 @@ RULES
   list [<FILTER>]      one line per rule: an ID, a TAB, then process,
                        action, remote, protocol/port, owner -- and, where
                        there is something to do, what:
+                         cleanup?[never-matches] a '*' where Little Snitch matches none
                          cleanup?[program-gone]  the program no longer exists
                          cleanup?[user-gone]     its owner is no user here
                          cleanup?[expired]       an expired temporary rule
@@ -925,10 +954,12 @@ RULES
   deny  [go] <PROCESS> <REMOTE> ...
                        shows the outgoing rule it would add; with go, adds it
                        (one already there is said, not doubled).
-                         PROCESS  any, a path ('*' allowed), or a name found
-                                  on $PATH (aria2c). A Homebrew program gets
-                                  '*' for its version parts -- and a Python
-                                  is its Python.app -- so upgrades keep the rule
+                         PROCESS  any, a path, or a name found on $PATH
+                                  (aria2c). A Homebrew program gets '*' for its
+                                  version folder -- Little Snitch's one
+                                  wildcard -- and a Python is its Python.app,
+                                  so upgrades keep the rule (a new python@3.16
+                                  is another program: allow it again)
                          REMOTE   a domain (and its hosts), a host with
                                   --host, or any
                          --port   default 443 (tcp); --owner default
@@ -943,13 +974,17 @@ RULES
   A change exports the rules (the backup, in BACKUP_DIR), exports again and
   refuses if a rule moved meanwhile, restores, and checks the result. Not
   atomic: a rule Little Snitch itself makes during the restore call is lost.
-  No change before 'diag roundtrip go' has passed on the machine.
+  No change before 'diag roundtrip go' has passed on the machine. The check
+  proves the rule was STORED, not that it matches: only a connection it lets
+  through proves that.
 
 TRAFFIC
   log [<PROCESS>|<FILTER>] [--since 1h] [--denied]
                        the connections Little Snitch counted: local time,
-                       in/out, program, remote, protocol/port, connects,
-                       DENIED. A PROCESS (aria2c, a path) matches all its
+                       in/out, program, remote, protocol/port, bytes in and
+                       out, new connects (when any), DENIED -- bytes with no
+                       connects is traffic on an open connection, 0 bytes is
+                       nothing moved. A PROCESS (aria2c, a path) matches all its
                        versions; anything else is a part of the line
 
 ADMIN
@@ -959,7 +994,7 @@ ADMIN
 OPTIONS
   -Q, --quiet              nothing on the terminal but results and errors
   -V, --verbose            also each littlesnitch call, the backup, the
-                           full program path and bytes in the log
+                           full program path in the log
   -D, --debug              also the diagnostics (~~~); implies -V
   --config <FILE>          read FILE instead of searching for one
   --create-config [<FILE>] the default config, to stdout or into a new FILE
@@ -1195,6 +1230,7 @@ date,direction,uid,ipAddress,remoteHostname,protocol,port,connectCount,denyCount
 2026-10-22T00:41:07Z,out,501,1.2.3.4,files.example.org,6,443,3,0,100,200,"{cellar}/aria2/1.37.0/bin/aria2c",
 2026-10-22T00:41:09Z,out,501,1.2.3.5,dl3.example.org,6,443,1,1,0,0,"{cellar}/aria2/1.36.0/bin/aria2c",
 2026-10-22T00:42:00Z,out,501,1.2.3.6,updates.example.com,6,443,1,0,34,0,"/Applications/Player.app/Contents/MacOS/Player",
+2026-10-22T00:42:10Z,out,501,1.2.3.7,stream.example.net,6,443,0,0,1536000,512,"/Applications/Player.app/Contents/MacOS/Player",
 """
 
 
@@ -1289,10 +1325,12 @@ def t_allow_shows_then_go(t: T) -> None:
     rc, _, errs = t.run(["allow", "aria2c", "example.org"])
     t.check(rc == 0 and "would add:" in errs and len(t.rules()) == 5, f"without go nothing changes: {errs}")
     t.check(f"path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c" in errs, f"the Homebrew version made '*': {errs}")
-    t.check("the version parts made '*'" in errs, "and it says so")
+    t.check("its version folder made '*', as Little Snitch's alert writes it" in errs, "and it says so")
     rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
     new = t.rules()[-1]
     t.check(rc == 0 and "added:" in errs and len(t.rules()) == 6, f"go adds it: {errs}")
+    t.check("proven only by a connection it lets through: my-little-snitch log aria2c" in errs,
+            f"'added' does not claim the rule works: {errs}")
     t.check(new.get("remote-domains") == "example.org" and new.get("ports") == "443"
             and new.get("protocol") == "tcp" and new.get("uid") == t.uid and "direction" not in new,
             f"the rule as the alert writes it: {new}")
@@ -1315,8 +1353,14 @@ def t_python_is_its_app(t: T) -> None:
     (fw / "bin" / "python3.15").chmod(0o755)
     (t.dir / "bin" / "python3").symlink_to(fw / "bin" / "python3.15")
     rc, _, errs = t.run(["allow", "python3", "example.org"])
-    want = f"path.{str(t.cellar)[1:]}/python@*/*/Frameworks/Python.framework/Versions/*/Resources/Python.app/Contents/MacOS/Python"
-    t.check(rc == 0 and want in errs, f"any Homebrew Python, as its Python.app: {errs}")
+    want = f"path.{str(t.cellar)[1:]}/python@3.15/*/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python"
+    t.check(rc == 0 and want in errs, f"Little Snitch's own form: only the version folder '*', as its Python.app: {errs}")
+    for bad in (f"{t.cellar}/python@*/*/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python",
+                f"{t.cellar}/python@3.15/*/Frameworks/Python.framework/Versions/*/Resources/Python.app/Contents/MacOS/Python"):
+        rc, _, errs = t.run(["allow", bad, "example.org"])
+        t.check(rc == 1 and "matches a '*' only as Homebrew's version folder" in errs, f"refused: {bad}: {errs}")
+    t.check(verdict({"process": f"path.{str(t.cellar)[1:]}/python@*/*/bin/python3", "remote": "any"})
+            == "cleanup?[never-matches]", "a stored rule with such a '*' is marked as never matching")
 
 
 def t_roundtrip_gate(t: T) -> None:
@@ -1376,8 +1420,13 @@ def t_log(t: T) -> None:
     t.check(len(out.splitlines()) == 1, f"--denied: {out}")
     _, out, _ = t.run(["log", "updates"])
     t.check(len(out.splitlines()) == 1 and "updates.example.com" in out, f"a FILTER: {out}")
+    t.check("in 100 B out 200 B  3 connects" in lines[0] and "in 0 B out 0 B  1 connect  DENIED 1" in lines[1],
+            f"bytes always, then the new connects: {out}")
+    _, out, _ = t.run(["log", "stream"])
+    t.check(out.strip().endswith("in 1.5 MB out 512 B") and "connect" not in out,
+            f"bytes with no new connection: no '0 connects', which read as nothing happened: {out}")
     _, out, _ = t.run(["-V", "log", "aria2c"])
-    t.check("in 100 B out 200 B" in out and str(t.cellar) in out, f"-V: bytes and the full path: {out}")
+    t.check(str(t.cellar) in out, f"-V: the full path: {out}")
 
 
 def t_refusals(t: T) -> None:

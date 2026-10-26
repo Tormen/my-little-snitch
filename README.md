@@ -34,6 +34,7 @@ is something to do -- one token saying what:
 
 | token | means |
 |---|---|
+| `cleanup?[never-matches]` | a `*` where Little Snitch has none: it matches nothing (see below) |
 | `cleanup?[program-gone]` | the program it names no longer exists |
 | `cleanup?[user-gone]` | its owner uid is no user on this machine |
 | `cleanup?[expired]` | an expired temporary rule (Little Snitch's "suggestion") |
@@ -42,16 +43,22 @@ is something to do -- one token saying what:
 The ID is a hash of the rule without Little Snitch's counters, so it stays
 the same from one `list` to the next; a changed rule gets a new one.
 
-**allow / deny** -- an outgoing rule. PROCESS is `any`, a path (a `*` in it
-is taken as written), or a name found on `$PATH` and `PROGRAM_PATH`
-(`aria2c`). A Homebrew program gets `*` for its version parts, as Little
-Snitch's own alert writes it -- and a Python is its `Python.app`, which is
-what connects -- so the rule survives upgrades:
+**allow / deny** -- an outgoing rule. PROCESS is `any`, a path, or a name
+found on `$PATH` and `PROGRAM_PATH` (`aria2c`). A Homebrew program gets `*`
+for its version folder, as Little Snitch's own alert writes it -- and a
+Python is its `Python.app`, which is what connects -- so the rule survives
+upgrades:
 
     my-little-snitch allow /opt/homebrew/bin/python3 api.example.org
-     >>> process: path.opt/homebrew/Cellar/python@*/*/Frameworks/Python.framework/Versions/*/Resources/Python.app/Contents/MacOS/Python
-        > (from /opt/homebrew/bin/python3 = ...: a Python connects as its Python.app; the version parts made '*', ...)
+     >>> process: path.opt/homebrew/Cellar/python@3.15/*/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python
+        > (from /opt/homebrew/bin/python3 = ...: a Python connects as its Python.app; its version folder made '*', ...)
      >>> would add: ...  allow  api.example.org  tcp/443  alice
+
+Little Snitch has no wildcards in process paths but this one: a `*` for the
+folder of Homebrew's version, right after `Cellar/<formula>/` (its
+developers, 2026-10). A `*` anywhere else -- `python@*`, `Versions/*` -- is
+stored by `restore-model` and never matches, so my-little-snitch refuses it.
+A new minor version (`python@3.16`) is another program: allow it again.
 
 REMOTE is a domain (and its hosts), a host with `--host`, or `any`. `--port`
 defaults to 443 (tcp), `--owner` to `OWNER_DEFAULT`. A rule that is already
@@ -65,10 +72,13 @@ there is said, never doubled.
 exists: exactly the `cleanup?` lines of `list`.
 
 **log** -- the connections Little Snitch counted (`littlesnitch log-traffic`):
-local time, in/out, program, remote, protocol/port, connects, `DENIED n`. A
-PROCESS (`aria2c`, a path) matches every Homebrew version of it, as the
-connecting program or the app around it; anything else is a part of the
-line. `--denied`: only lines with a denial. `-V` adds bytes and the full path.
+local time, in/out, program, remote, protocol/port, bytes in and out, new
+connects (when there were any), `DENIED n`. Each line is a sample of a
+connection: bytes with no connects is traffic on an open connection, 0 bytes
+is nothing moved. A PROCESS (`aria2c`, a path) matches every Homebrew version
+of it, as the connecting program or the app around it; anything else is a
+part of the line. `--denied`: only lines with a denial. `-V` adds the full
+path.
 
     my-little-snitch log aria2c --since 1d --denied
 
@@ -85,6 +95,10 @@ line. `--denied`: only lines with a denial. `-V` adds bytes and the full path.
 4. restores the copy (`-t`: Terminal access stays on)
 5. exports once more; the rules must be exactly what was asked -- otherwise
    an ERROR names the backup and the command to restore it
+
+Step 5 proves the rule was STORED, not that it MATCHES: only a connection
+it lets through proves that (`log <PROCESS>` after the next run), and the
+`added:` line says so.
 
 It is NOT atomic. Steps 1-5 run under a lock against other
 my-little-snitch runs (a dead run's lock is broken, and said), but Little
