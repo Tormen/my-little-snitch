@@ -726,7 +726,7 @@ def cmd_add(s: Settings, action: str, args: Sequence[str]) -> int:
     backup = change_model(s, lambda now: now + [r], expect_rules(want))
     OUT.msg(f" >>> added: {shown}  [rules {len(rules)} -> {len(want)}]")
     OUT.msg(f"    > stored and read back -- proven only by a connection it lets through: "
-            f"{SCRIPT_NAME} log {shlex.quote(a.process)}")
+            f"{SCRIPT_NAME} log {shlex.quote(a.remote if a.process == 'any' else a.process)}")
     OUT.det(f"    > the rules before: {backup}")
     return 0
 
@@ -1339,6 +1339,8 @@ def t_allow_shows_then_go(t: T) -> None:
     t.check(rc == 0 and "already there" in errs and len(t.rules()) == 6, f"never doubled: {errs}")
     rc, _, errs = t.run(["deny", "go", "any", "evil.example", "--owner", "anyone", "--port", "any"])
     new = t.rules()[-1]
+    t.check("connection it lets through: my-little-snitch log evil.example" in errs,
+            f"for any process the proof is the remote's log, not 'log any': {errs}")
     t.check(rc == 0 and "process" not in new and "uid" not in new and "ports" not in new and new["action"] == "deny",
             f"any process, anyone, any port: {new} {errs}")
 
