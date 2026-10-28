@@ -477,7 +477,7 @@ def find_program(s: Settings, asked: str) -> Program:
             err("00019", f"'{asked}': Little Snitch matches a '*' only as Homebrew's version folder "
                          f"(/Cellar/<formula>/*/...) -- anywhere else it never matches")
         if not glob.glob(asked):
-            err("00019", f"'{asked}' matches no file")
+            err("00020", f"'{asked}' matches no file")
         return Program("path." + asked[1:], asked, asked, "")
     if "/" in asked:
         found = asked
@@ -485,10 +485,10 @@ def find_program(s: Settings, asked: str) -> Program:
         dirs = os.environ.get("PATH", "").split(":") + list(s.program_path)
         hit = shutil.which(asked, path=":".join(d for d in dirs if d))
         if hit is None:
-            err("00020", f"no program '{asked}' on $PATH or PROGRAM_PATH -- give its full path")
+            err("00021", f"no program '{asked}' on $PATH or PROGRAM_PATH -- give its full path")
         found = hit
     if not os.path.exists(found):
-        err("00021", f"'{found}' does not exist")
+        err("00022", f"'{found}' does not exist")
     real = os.path.realpath(found)
     notes: List[str] = []
     py = _PY_BIN.match(real)
@@ -507,7 +507,7 @@ def find_owner(s: Settings, given: Optional[str]) -> Tuple[Rule, str]:
     """The owner fields of a new rule, and how to show them."""
     owner = given or s.owner_default
     if not owner:
-        err("00022", "whose rule? --owner <USER>|anyone|system (or OWNER_DEFAULT in the config)")
+        err("00023", "whose rule? --owner <USER>|anyone|system (or OWNER_DEFAULT in the config)")
     if owner == "anyone":
         return {}, "anyone"
     if owner == "system":
@@ -515,7 +515,7 @@ def find_owner(s: Settings, given: Optional[str]) -> Tuple[Rule, str]:
     try:
         return {"uid": pwd.getpwnam(owner).pw_uid}, owner
     except KeyError:
-        err("00023", f"--owner '{owner}': no such user here (a user, anyone or system)")
+        err("00024", f"--owner '{owner}': no such user here (a user, anyone or system)")
 
 
 # --- 4. changing the model -----------------------------------------------------
@@ -546,7 +546,7 @@ def locked(s: Settings) -> Generator[None, None, None]:
                 owner = ""
             m = re.match(r"pid=(\d+)", owner)
             if m is None or _alive(int(m.group(1))):
-                err("00024", f"another {SCRIPT_NAME} is changing the rules ({owner or 'owner not yet written'}): "
+                err("00025", f"another {SCRIPT_NAME} is changing the rules ({owner or 'owner not yet written'}): "
                              f"{lock} -- run again when it is done")
             OUT.msg(f" >>> breaking a stale lock: its owner is gone ({owner})")
             with contextlib.suppress(OSError):
@@ -569,7 +569,7 @@ def prepare_dir(s: Settings) -> None:
         s.backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(s.backup_dir, 0o700)
     except OSError as e:
-        err("00025", f"cannot make BACKUP_DIR {s.backup_dir}: {e.strerror}")
+        err("00026", f"cannot make BACKUP_DIR {s.backup_dir}: {e.strerror}")
 
 
 ROUNDTRIP_OK: Final = "roundtrip.ok"
@@ -583,7 +583,7 @@ def change_model(s: Settings, change: Callable[[List[Rule]], List[Rule]], expect
     itself is lost -- the backup is the remedy. Returns the backup."""
     prepare_dir(s)
     if not roundtrip and not (s.backup_dir / ROUNDTRIP_OK).is_file():
-        err("00026", f"no change before '{SCRIPT_NAME} diag roundtrip go' has passed on this machine: "
+        err("00027", f"no change before '{SCRIPT_NAME} diag roundtrip go' has passed on this machine: "
                      "it proves a restore loses nothing")
     with locked(s):
         backup = s.backup_dir / f"{datetime.datetime.now():%Y-%m-%d_%H%M%S}.json"
@@ -602,7 +602,7 @@ def change_model(s: Settings, change: Callable[[List[Rule]], List[Rule]], expect
             phase("exporting again, to see whether a rule moved meanwhile")
             again = rules_of(export_model(s, check))
             if [rule_key(r) for r in again] != [rule_key(r) for r in before]:
-                err("00027", "a rule changed in Little Snitch while this run prepared its change -- "
+                err("00028", "a rule changed in Little Snitch while this run prepared its change -- "
                              "nothing restored; run it again")
             phase("restoring the changed rules")
             littlesnitch(s, "restore-model", "-t", str(new))
@@ -610,7 +610,7 @@ def change_model(s: Settings, change: Callable[[List[Rule]], List[Rule]], expect
             now = rules_of(export_model(s, check))
             wrong = expect(now)
             if wrong:
-                err("00028", "after the restore the rules are not what was asked: " + "; ".join(wrong[:5])
+                err("00029", "after the restore the rules are not what was asked: " + "; ".join(wrong[:5])
                              + f" -- the rules before are in {backup}; as root: "
                              + shlex.join([s.littlesnitch, "restore-model", "-t", str(backup)]))
         finally:
@@ -649,7 +649,7 @@ def load_rules(s: Settings) -> List[Rule]:
 
 def cmd_list(s: Settings, args: Sequence[str]) -> int:
     if len(args) > 1:
-        err("00029", "list takes one <FILTER> at most")
+        err("00030", "list takes one <FILTER> at most")
     rules = load_rules(s)
     shown = [line for line in (rule_line(r) for r in rules) if not args or args[0] in line]
     for line in shown:
@@ -680,10 +680,10 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
         if key in ("--port", "--owner", "--via"):
             v = val if eq else next(it, None)
             if not v:
-                err("00030", f"{key} needs a value")
+                err("00031", f"{key} needs a value")
             if key == "--port":
                 if v != "any" and not re.fullmatch(r"\d+(-\d+)?", v):
-                    err("00031", f"--port '{v}': a number, a range like 6881-6889, or any")
+                    err("00032", f"--port '{v}': a number, a range like 6881-6889, or any")
                 a.port = v
             elif key == "--via":
                 a.via = v
@@ -694,18 +694,18 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
         elif x == "--incoming":
             a.incoming = True
         elif x.startswith("-"):
-            err("00032", f"no such option for {verb}: '{x}' ({SCRIPT_NAME} --help)")
+            err("00033", f"no such option for {verb}: '{x}' ({SCRIPT_NAME} --help)")
         else:
             rest.append(x)
     if rest[:1] == ["go"]:
         a.go = True
         rest = rest[1:]
     if len(rest) != 2:
-        err("00033", f"{verb} [go] <PROCESS> <REMOTE> -- e.g. {SCRIPT_NAME} {verb} aria2c any")
+        err("00034", f"{verb} [go] <PROCESS> <REMOTE> -- e.g. {SCRIPT_NAME} {verb} aria2c any")
     a.process, a.remote = rest
     if a.port is None:
         if a.incoming:      # 443 is where a client connects TO; what a program listens on, only the caller knows
-            err("00054", f"{verb} --incoming: on which port does it listen? --port <N>|any")
+            err("00035", f"{verb} --incoming: on which port does it listen? --port <N>|any")
         a.port = "443"
     return a
 
@@ -827,16 +827,16 @@ def cmd_remove(s: Settings, args: Sequence[str]) -> int:
     go = args[:1] == ["go"]
     ids = ids_from(args[1:] if go else args)
     if not ids:
-        err("00034", f"remove [go] <ID>.. -- or the IDs on stdin: {SCRIPT_NAME} list x | cut -f 1 | {SCRIPT_NAME} remove")
+        err("00036", f"remove [go] <ID>.. -- or the IDs on stdin: {SCRIPT_NAME} list x | cut -f 1 | {SCRIPT_NAME} remove")
     bad = [i for i in ids if not re.fullmatch(r"[0-9a-f]{6}", i)]
     if bad:
-        err("00035", f"not an ID (6 hex digits, the first column of 'list'): {' '.join(bad[:5])}")
+        err("00037", f"not an ID (6 hex digits, the first column of 'list'): {' '.join(bad[:5])}")
 
     def pick(rules: List[Rule]) -> List[Rule]:
         by_id = {rule_id(r): r for r in rules}
         unknown = [i for i in ids if i not in by_id]
         if unknown:
-            err("00036", f"no rule with ID {' '.join(unknown[:5])} -- 'list' again: a changed rule has a new ID")
+            err("00038", f"no rule with ID {' '.join(unknown[:5])} -- 'list' again: a changed rule has a new ID")
         return [by_id[i] for i in dict.fromkeys(ids)]
 
     return remove_rules(s, "remove", go, pick)
@@ -844,7 +844,7 @@ def cmd_remove(s: Settings, args: Sequence[str]) -> int:
 
 def cmd_cleanup(s: Settings, args: Sequence[str]) -> int:
     if args not in ([], ["go"]):
-        err("00037", "cleanup [go] -- it takes nothing else")
+        err("00039", "cleanup [go] -- it takes nothing else")
     return remove_rules(s, "cleanup", args == ["go"], lambda rules: [r for r in rules if verdict(r).startswith("cleanup?")])
 
 
@@ -854,7 +854,7 @@ _SINCE: Final = re.compile(r"(\d+)([mhd])$")
 def since_of(text: str) -> datetime.datetime:
     m = _SINCE.match(text)
     if m is None:
-        err("00038", f"--since '{text}': a number and m, h or d (30m, 1h, 2d)")
+        err("00040", f"--since '{text}': a number and m, h or d (30m, 1h, 2d)")
     unit = {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
     return datetime.datetime.now() - datetime.timedelta(seconds=int(m.group(1)) * unit)
 
@@ -895,16 +895,16 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
         if key == "--since":
             v = val if eq else next(it, None)
             if not v:
-                err("00039", "--since needs a time: 30m, 1h, 2d")
+                err("00041", "--since needs a time: 30m, 1h, 2d")
             since = v
         elif x == "--denied":
             denied = True
         elif x.startswith("-"):
-            err("00040", f"no such option for log: '{x}' ({SCRIPT_NAME} --help)")
+            err("00042", f"no such option for log: '{x}' ({SCRIPT_NAME} --help)")
         elif what is None:
             what = x
         else:
-            err("00041", "log [<PROCESS>|<FILTER>] [--since 1h] [--denied] -- one PROCESS or FILTER")
+            err("00043", "log [<PROCESS>|<FILTER>] [--since 1h] [--denied] -- one PROCESS or FILTER")
     start = since_of(since)
     pattern: Optional[str] = None
     if what is not None and ("/" in what or shutil.which(what, path=":".join(
@@ -918,7 +918,7 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
     except FileNotFoundError:
-        err("00042", f"Little Snitch's command line tool is not at {s.littlesnitch} (LITTLESNITCH in the config)")
+        err("00044", f"Little Snitch's command line tool is not at {s.littlesnitch} (LITTLESNITCH in the config)")
     assert p.stdout is not None and p.stderr is not None, "both pipes were asked for"
     shown = seen = 0
     first = p.stdout.readline()
@@ -941,10 +941,10 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
     rc = p.wait()
     said = (rest + errs).strip()
     if "not authorized" in said:
-        err("00043", "Little Snitch refuses its command line tool -- switch on "
+        err("00045", "Little Snitch refuses its command line tool -- switch on "
                      "Little Snitch > Settings > Security > \"Allow access via Terminal\"")
     if rc != 0:
-        err("00044", f"littlesnitch log-traffic failed [rc {rc}]: {said[:300]}")
+        err("00046", f"littlesnitch log-traffic failed [rc {rc}]: {said[:300]}")
     which = f"{what} = {pattern}" if pattern else (f"lines holding '{what}'" if what else "everything")
     OUT.msg(f" >>> {shown} of {seen} line(s) since {start:%Y-%m-%d %H:%M}: {which}" + (", denied only" if denied else ""))
     return 0
@@ -957,7 +957,7 @@ def cmd_diag(s: Settings, args: Sequence[str]) -> int:
         if rest[:1] == ["--since"] and len(rest) == 2:
             since = rest[1]
         elif rest:
-            err("00045", "diag events [--since 10m]")
+            err("00047", "diag events [--since 10m]")
         since_of(since)
         OUT.result(littlesnitch(s, "log", "-l", since).rstrip("\n"))
         return 0
@@ -973,7 +973,7 @@ def cmd_diag(s: Settings, args: Sequence[str]) -> int:
             f"{len(rules)} rules, backup {backup}\n", encoding="utf-8")
         OUT.msg(f" >>> roundtrip passed: {len(rules)} rules restored unchanged [backup {backup}]")
         return 0
-    err("00046", "diag roundtrip [go] | diag events [--since 10m]")
+    err("00048", "diag roundtrip [go] | diag events [--since 10m]")
 
 
 def version_line() -> str:
@@ -1113,7 +1113,7 @@ def parse_cli(argv: Sequence[str]) -> Cli:
         elif key == "--config":
             v = val if eq else next(it, None)
             if not v:
-                err("00047", "--config needs a <FILE>")
+                err("00049", "--config needs a <FILE>")
             c.config = v
         elif a in ("-h", "--help"):
             c.command = "help"
@@ -1121,9 +1121,9 @@ def parse_cli(argv: Sequence[str]) -> Cli:
             if a.startswith("-"):
                 verb = a.lstrip("-")
                 hint = f" -- you mean `{SCRIPT_NAME} {verb}`" if verb in COMMANDS else f" ({SCRIPT_NAME} --help)"
-                err("00048", f"no such option '{a}'{hint}")
+                err("00050", f"no such option '{a}'{hint}")
             if a not in COMMANDS:
-                err("00049", f"'{a}' is no command ({SCRIPT_NAME} --help)")
+                err("00051", f"'{a}' is no command ({SCRIPT_NAME} --help)")
             c.command = a
         else:
             c.args.append(a)
@@ -1139,7 +1139,7 @@ def create_config(target: Optional[str]) -> int:
         with p.open("x", encoding="utf-8") as f:
             f.write(DEFAULT_CONFIG)
     except FileExistsError:
-        err("00050", f"{p} exists -- never written over (compare it with `{SCRIPT_NAME} --create-config`)")
+        err("00052", f"{p} exists -- never written over (compare it with `{SCRIPT_NAME} --create-config`)")
     OUT.msg(f" >>> wrote the default config to {p}")
     return 0
 
@@ -1161,7 +1161,7 @@ def run(argv: Sequence[str]) -> int:
         OUT.result(HELP)
         return 0
     if _geteuid() != 0:
-        err("00051", f"needs root -- littlesnitch refuses anyone else; as root: {SCRIPT_NAME} {shlex.join(argv)}")
+        err("00053", f"needs root -- littlesnitch refuses anyone else; as root: {SCRIPT_NAME} {shlex.join(argv)}")
     s = load_settings(c.config)
     OUT.dbg_on = c.dbg if c.dbg is not None else s.dbg
     OUT.vrb = OUT.dbg_on or (c.vrb if c.vrb is not None else s.vrb)
@@ -1252,7 +1252,7 @@ def main(argv: Sequence[str]) -> int:
                   f"run it again")
         return 130
     except OSError as e:
-        OUT.error(f"ERROR 00052 [1]: while {_phase}: {e.strerror or e}" + (f": {e.filename}" if e.filename else ""))
+        OUT.error(f"ERROR 00054 [1]: while {_phase}: {e.strerror or e}" + (f": {e.filename}" if e.filename else ""))
         return 1
     except Exception as e:   # a bug: one line here, the trace in a file
         where = trace_file()
@@ -1260,7 +1260,7 @@ def main(argv: Sequence[str]) -> int:
             where.write_text(f"{version_line()}\nargv: {list(argv)}\n\n{traceback.format_exc()}", encoding="utf-8")
         except OSError:
             where = Path("(not written)")
-        OUT.error(f"ERROR 00053 [70]: unexpected {type(e).__name__} while {_phase} -- the trace: {where}")
+        OUT.error(f"ERROR 00055 [70]: unexpected {type(e).__name__} while {_phase} -- the trace: {where}")
         return 70
 
 
@@ -1529,7 +1529,7 @@ def t_refuse_if_changed(t: T) -> None:
     t.passed_roundtrip()
     t.mode("drift")
     rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
-    t.check(rc == 1 and "ERROR 00027" in errs and not (t.dir / "restored").exists(),
+    t.check(rc == 1 and "ERROR 00028" in errs and not (t.dir / "restored").exists(),
             f"a rule moved between the exports: nothing restored: {errs}")
 
 
@@ -1537,7 +1537,7 @@ def t_verify_after_restore(t: T) -> None:
     t.passed_roundtrip()
     t.mode("lossy")
     rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
-    t.check(rc == 1 and "ERROR 00028" in errs and "missing" in errs and "restore-model -t" in errs
+    t.check(rc == 1 and "ERROR 00029" in errs and "missing" in errs and "restore-model -t" in errs
             and str(t.dir / "state") in errs, f"a lost rule is found, the backup named: {errs}")
 
 
