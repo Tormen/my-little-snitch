@@ -343,15 +343,21 @@ def rule_meaning(r: Rule) -> str:
     return json.dumps({k: r.get(k) for k in SAME_FIELDS}, sort_keys=True)
 
 
-def show_process(r: Rule) -> str:
-    p = r.get("process")
-    if p is None:
-        return "any"
+def show_program(p: object) -> str:
     text = str(p)
     for prefix, shown in (("path.", "/"), ("script.", "script /"), ("identifier.", "")):
         if text.startswith(prefix):
             return shown + text[len(prefix):].lstrip("/")     # script. keeps its leading /, path. drops it
     return text
+
+
+def show_process(r: Rule) -> str:
+    """The process, and the program it runs through (`via`: a script's
+    interpreter, curl for a shell script) -- two rules differing only there
+    are two rules."""
+    p = r.get("process")
+    shown = "any" if p is None else show_program(p)
+    return shown + (f" via {show_program(r['via'])}" if "via" in r else "")
 
 
 def show_remote(r: Rule) -> str:
@@ -384,12 +390,19 @@ _VERSION_DIR: Final = re.compile(r"/Cellar/[^/]+/\d[^/]*/")
 
 
 def program_paths(r: Rule) -> List[str]:
-    """The file(s) a rule names on disk -- none for any process or a code identity."""
-    p = str(r.get("process", ""))
-    for prefix in ("path.", "script."):
-        if p.startswith(prefix):
-            return ["/" + p[len(prefix):].lstrip("/")]
-    return [p] if p.startswith("/") else []
+    """The file(s) a rule names on disk, its process and its via program --
+    none for any process or a code identity."""
+    paths: List[str] = []
+    for key in ("process", "via"):
+        p = str(r.get(key, ""))
+        for prefix in ("path.", "script."):
+            if p.startswith(prefix):
+                paths.append("/" + p[len(prefix):].lstrip("/"))
+                break
+        else:
+            if p.startswith("/"):
+                paths.append(p)
+    return paths
 
 
 def verdict(r: Rule) -> str:
@@ -940,11 +953,12 @@ Little Snitch's rules and traffic from the command line. Root only, and
 Little Snitch > Settings > Security > "Allow access via Terminal" on.
 
 RULES
-  list [<FILTER>]      one line per rule: an ID, a TAB, then process,
-                       action, remote, protocol/port, owner -- and, where
-                       there is something to do, what:
+  list [<FILTER>]      one line per rule: an ID, a TAB, then process
+                       (and 'via' the program it runs through, curl for a
+                       script), action, remote, protocol/port, owner -- and,
+                       where there is something to do, what:
                          cleanup?[never-matches] a '*' where Little Snitch matches none
-                         cleanup?[program-gone]  the program no longer exists
+                         cleanup?[program-gone]  its program, or its via one, no longer exists
                          cleanup?[user-gone]     its owner is no user here
                          cleanup?[expired]       an expired temporary rule
                          allow?[version-path]    works, but breaks on the next
@@ -1318,6 +1332,26 @@ def t_list_verdicts(t: T) -> None:
             and show_process({"process": "path.opt/x"}) == "/opt/x", "one slash before a script's or a path's path")
     _, out3, _ = t.run(["list", "pypi"])
     t.check(out3.splitlines() == [lines[1]], f"a FILTER: {out3}")
+    script = t.dir / "fetch.sh"
+    script.write_text("#!/bin/sh\n")
+    curl = t.cellar / "aria2" / "1.37.0" / "bin" / "aria2c"      # a program that exists, standing in for curl
+    t.model([{"action": "allow", "process": "script." + str(script), "via": "path." + str(curl)[1:],
+              "remote-domains": "keep.org"},
+             {"action": "allow", "process": "script." + str(script), "via": "path.usr/gone/curl",
+              "remote-domains": "keep.org"},
+             {"action": "allow", "process": "script." + str(script), "remote-domains": "keep.org"},
+             {"action": "allow", "process": "identifier.APPLE/com.apple.Terminal",
+              "via": "identifier.APPLE/com.apple.curl", "remote": "any"}])
+    _, out4, _ = t.run(["list"])
+    via = out4.splitlines()
+    t.check(f"script {script} via {curl}  allow" in via[0] and "cleanup?" not in via[0].replace("version-path", ""),
+            f"the via program shown, after the process: {via[0]}")
+    t.check("via /usr/gone/curl" in via[1] and "cleanup?[program-gone]" in via[1],
+            f"a via program that is gone: {via[1]}")
+    t.check(" via " not in via[2] and "cleanup?" not in via[2], f"no via, none shown: {via[2]}")
+    t.check("APPLE/com.apple.Terminal via APPLE/com.apple.curl  allow" in via[3], f"a via code identity: {via[3]}")
+    _, out5, _ = t.run(["list", "gone/curl"])
+    t.check(out5.splitlines() == [via[1]], f"a FILTER finds the via program: {out5}")
 
 
 def t_allow_shows_then_go(t: T) -> None:

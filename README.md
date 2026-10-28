@@ -29,13 +29,14 @@ my-little-snitch edits the exported model and restores it -- carefully, see
 Every command that changes rules shows what it would do; with `go` it does it.
 
 **list** -- one line per rule: an ID (6 hex), a TAB (so `cut -f 1` takes
-it), then process, action, remote, protocol/port, owner, and -- where there
-is something to do -- one token saying what:
+it), then process (and `via` the program it runs through -- curl, for a
+script that calls it), action, remote, protocol/port, owner, and -- where
+there is something to do -- one token saying what:
 
 | token | means |
 |---|---|
 | `cleanup?[never-matches]` | a `*` where Little Snitch has none: it matches nothing (see below) |
-| `cleanup?[program-gone]` | the program it names no longer exists |
+| `cleanup?[program-gone]` | the program it names, or its via program, no longer exists |
 | `cleanup?[user-gone]` | its owner uid is no user on this machine |
 | `cleanup?[expired]` | an expired temporary rule (Little Snitch's "suggestion") |
 | `allow?[version-path]` | works, but names one Homebrew version: breaks on the next upgrade -- `allow go` its program again, then `remove go` this one |
@@ -112,8 +113,9 @@ cannot see it. The backup is the remedy. The counters (`useCount`,
 `rules` is a list of flat dicts:
 
 - `process`: `path.<path without the leading />` (with `*`),
-  `identifier.<TEAM>/<bundle id>`, `script.<path>` with `via`, an older plain
-  `/path`, or absent = any process
+  `identifier.<TEAM>/<bundle id>`, `script.<path>`, an older plain
+  `/path`, or absent = any process; `via`, the program it runs through,
+  is read in the same forms (its exact form in an export not yet seen)
   (`requiresTrustedSignatureForAnyProcess`: "Require: Trusted Code Signature")
 - owner: `uid` = that user's "Me", `owner: "system"`, neither = anyone
 - remote: `remote-domains` / `remote-hosts` / `remote-addresses`, or
