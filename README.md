@@ -134,14 +134,19 @@ The change says how many first, and step 5 leaves them to Little Snitch.
 
 - `process`: `path.<path without the leading />` (with `*`),
   `identifier.<TEAM>/<bundle id>`, `script.<path>`, an older plain
-  `/path`, or absent = any process; `via`, the program it runs through:
-  `identifier.APPLE/com.apple.ping` for an Apple program, else its plain path
+  `/path`, or absent = any process; `via`, the program it runs through, in
+  the same forms (`identifier.APPLE/com.apple.ping`,
+  `path.usr/local/Cellar/pure-ftpd/*/sbin/pure-ftpd`; the plain `/path` is
+  read, never written)
   (`requiresTrustedSignatureForAnyProcess`: "Require: Trusted Code Signature")
 - owner: `uid` = that user's "Me", `owner: "system"`, neither = anyone
 - remote: `remote-domains` / `remote-hosts` / `remote-addresses`, or
-  `remote: "any"` / `"local-net"`
-- `action`: allow / deny / suggestion; `direction` absent = outgoing
-- `ports`, `protocol`; `origin`, `creationDate`, `modificationDate`; `lifetime` for a temporary rule;
+  `remote: "any"` / `"local-net"`; addresses as a pattern (`192.168.192.*`)
+  or a list (`192.168.192.110, 192.168.192.167`)
+- `action`: allow / deny / suggestion; `direction`: absent = outgoing,
+  `incoming`, or `both` (Little Snitch's factory rules)
+- `ports` (`22000`, a list `32410, 32412-32414`), `protocol`, the same in
+  both directions; `origin`, `creationDate`, `modificationDate`; `lifetime` for a temporary rule;
   `useCount`, `lastUsed` are Little Snitch's own counters
 
 The traffic log is CSV: date (UTC), direction, uid, ipAddress,

@@ -751,10 +751,11 @@ def apple_identity(p: Program) -> Optional[str]:
     return None
 
 
-def via_form(p: Program) -> str:
-    """A via program as Little Snitch stores one: its Apple identity, else its
-    plain path -- never `path.`, which it uses for a process only."""
-    return apple_identity(p) or p.path
+def stored_form(p: Program) -> str:
+    """A program as Little Snitch's alert stores it, as process or as via: its
+    Apple identity, else `path.<path>` (with Homebrew's '*'). Its older plain
+    `/path` is only read, never written."""
+    return apple_identity(p) or str(p.process)
 
 
 def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Optional[Program], str]:
@@ -770,9 +771,9 @@ def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Opti
         r["direction"] = "incoming"
     if prog.process is not None:
         r["process"] = ("script." + prog.path if via and is_script(prog.path)
-                        else apple_identity(prog) or prog.process)
+                        else stored_form(prog))
     if via and via.process is not None:
-        r["via"] = via_form(via)
+        r["via"] = stored_form(via)
     if a.remote == "any":
         r["remote"] = "any"
     else:
@@ -1508,8 +1509,9 @@ def t_allow_via(t: T) -> None:
     new = t.rules()[-1]
     t.check(rc == 0 and "added:" in errs and len(t.rules()) == 7,
             f"the same rule with a via is another rule, not 'already there': {errs}")
-    t.check(new.get("process") == f"script.{script}" and new.get("via") == star,
-            f"a script as Little Snitch names one, its via as a program: {new}")
+    t.check(new.get("process") == f"script.{script}" and new.get("via") == "path." + star[1:],
+            f"a script as Little Snitch names one; a Homebrew via as its alert writes one "
+            f"(path.usr/local/Cellar/pure-ftpd/*/sbin/pure-ftpd on ada): {new}")
     t.check("connection it lets through: my-little-snitch log aria2c" in errs,
             f"the proof is the via program's log -- it is what connects: {errs}")
     rc, _, errs = t.run(["allow", str(script), "example.org", "--via", "/usr/bin/curl"])
