@@ -150,7 +150,7 @@ The change says how many first, and step 5 leaves them to Little Snitch.
   `path.usr/local/Cellar/pure-ftpd/*/sbin/pure-ftpd`; the plain `/path` is
   read, never written)
   (`requiresTrustedSignatureForAnyProcess`: "Require: Trusted Code Signature")
-- owner: `uid` = that user's "Me", `owner: "system"`, neither = anyone
+- owner: `uid` = that user's "Me", `owner: "system"` (root too: Little Snitch stores uid 0 as system), neither = anyone
 - remote: `remote-domains` / `remote-hosts` / `remote-addresses`, or
   `remote: "any"` / `"local-net"`; addresses as a pattern (`192.168.192.*`)
   or a list (`192.168.192.110, 192.168.192.167`)

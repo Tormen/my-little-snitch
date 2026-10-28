@@ -513,7 +513,9 @@ def find_owner(s: Settings, given: Optional[str]) -> Tuple[Rule, str]:
     if owner == "system":
         return {"owner": "system"}, "system"
     try:
-        return {"uid": pwd.getpwnam(owner).pw_uid}, owner
+        uid = pwd.getpwnam(owner).pw_uid
+        # Little Snitch keeps no "Me" for root: its restore stores a uid-0 rule as owner system
+        return ({"owner": "system"}, "system") if uid == 0 else ({"uid": uid}, owner)
     except KeyError:
         err("00024", f"--owner '{owner}': no such user here (a user, anyone or system)")
 
@@ -1396,6 +1398,9 @@ if cmd == "restore-model":
     for r in m["rules"]:                       # as Little Snitch does: a restore ends the temporary rules
         if r.pop("lifetime", None):
             r.update({"action": "suggestion", "origin": "expiredTemporary", "approved": False})
+        if r.get("uid") == 0:                  # ...and keeps root's rule as owner system (horse, 2026-10-28)
+            del r["uid"]
+            r["owner"] = "system"
     json.dump(m, open(model, "w")); open(os.path.join(d, "restored"), "a").write("x\n"); sys.exit(0)
 if cmd == "log-traffic":
     sys.stdout.write(open(os.path.join(d, "traffic.csv")).read()); sys.exit(0)
@@ -1599,6 +1604,17 @@ def t_allow_via(t: T) -> None:
             f"an Apple program as via is its code identity, as Little Snitch stores ping's: {errs}")
     rc, _, errs = t.run(["allow", str(script), "example.org", "--via"])
     t.check(rc == 1 and "--via needs a value" in errs, errs)
+
+
+def t_allow_owner_root(t: T) -> None:
+    t.passed_roundtrip()
+    rc, _, errs = t.run(["allow", "go", "aria2c", "example.org", "--owner", "root"])
+    new = t.rules()[-1]
+    t.check(rc == 0 and "ERROR" not in errs and new.get("owner") == "system" and "uid" not in new,
+            f"--owner root is Little Snitch's owner system, as its restore stores it: {new} {errs}")
+    rc, out, _ = t.run(["list"])
+    t.check(rc == 0 and any("example.org" in l and " system" in l for l in out.splitlines()),
+            f"and list shows it as system: {out}")
 
 
 def t_allow_udp(t: T) -> None:
@@ -1833,7 +1849,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_udp, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]
