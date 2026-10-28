@@ -711,6 +711,22 @@ def is_script(path: str) -> bool:
         return False
 
 
+def via_form(p: Program) -> str:
+    """A via program as Little Snitch stores one: an Apple platform binary by
+    its code identity (`identifier.APPLE/com.apple.ping`), anything else by
+    its plain path -- never `path.`, which it uses for a process only."""
+    files = glob.glob(p.path) if "*" in p.path else [p.path]
+    try:
+        cs = subprocess.run(["/usr/bin/codesign", "-dv", files[0]], capture_output=True, text=True,
+                            stdin=subprocess.DEVNULL, timeout=10).stderr
+    except (OSError, subprocess.TimeoutExpired):
+        cs = ""
+    ident = re.search(r"^Identifier=(\S+)$", cs, re.M)
+    if ident and re.search(r"^Platform identifier=", cs, re.M):
+        return f"identifier.APPLE/{ident.group(1)}"
+    return p.path
+
+
 def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Optional[Program], str]:
     """The rule as Little Snitch's alert writes it. With a via program (curl,
     run by a script), a script PROCESS is named `script.<path>`, as Little
@@ -723,7 +739,7 @@ def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Opti
     if prog.process is not None:
         r["process"] = "script." + prog.path if via and is_script(prog.path) else prog.process
     if via and via.process is not None:
-        r["via"] = via.process
+        r["via"] = via_form(via)
     if a.remote == "any":
         r["remote"] = "any"
     else:
@@ -1358,9 +1374,9 @@ def t_list_verdicts(t: T) -> None:
     script = t.dir / "fetch.sh"
     script.write_text("#!/bin/sh\n")
     curl = t.cellar / "aria2" / "1.37.0" / "bin" / "aria2c"      # a program that exists, standing in for curl
-    t.model([{"action": "allow", "process": "script." + str(script), "via": "path." + str(curl)[1:],
+    t.model([{"action": "allow", "process": "script." + str(script), "via": str(curl),
               "remote-domains": "keep.org"},
-             {"action": "allow", "process": "script." + str(script), "via": "path.usr/gone/curl",
+             {"action": "allow", "process": "script." + str(script), "via": "/usr/gone/curl",
               "remote-domains": "keep.org"},
              {"action": "allow", "process": "script." + str(script), "remote-domains": "keep.org"},
              {"action": "allow", "process": "identifier.APPLE/com.apple.Terminal",
@@ -1416,10 +1432,13 @@ def t_allow_via(t: T) -> None:
     new = t.rules()[-1]
     t.check(rc == 0 and "added:" in errs and len(t.rules()) == 7,
             f"the same rule with a via is another rule, not 'already there': {errs}")
-    t.check(new.get("process") == f"script.{script}" and new.get("via") == "path." + star[1:],
+    t.check(new.get("process") == f"script.{script}" and new.get("via") == star,
             f"a script as Little Snitch names one, its via as a program: {new}")
     t.check("connection it lets through: my-little-snitch log aria2c" in errs,
             f"the proof is the via program's log -- it is what connects: {errs}")
+    rc, _, errs = t.run(["allow", str(script), "example.org", "--via", "/usr/bin/curl"])
+    t.check("via: identifier.APPLE/com.apple.curl" in errs,
+            f"an Apple program as via is its code identity, as Little Snitch stores ping's: {errs}")
     rc, _, errs = t.run(["allow", str(script), "example.org", "--via"])
     t.check(rc == 1 and "--via needs a value" in errs, errs)
 

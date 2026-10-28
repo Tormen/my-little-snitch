@@ -66,7 +66,8 @@ defaults to 443 (tcp), `--owner` to `OWNER_DEFAULT`. A rule that is already
 there is said, never doubled.
 
 `--via <PROGRAM>` is the program PROCESS connects through -- curl, run by a
-script or by brew -- found the same way as PROCESS. A script PROCESS is then
+script or by brew -- found the same way as PROCESS and written as Little Snitch stores one (an
+Apple program by its code identity, `com.apple.curl`). A script PROCESS is then
 `script.<path>`, as Little Snitch names the scripts it shows "via" something.
 The rule's proof is the via program's log (`log curl`): it is what connects.
 
@@ -121,8 +122,8 @@ cannot see it. The backup is the remedy. The counters (`useCount`,
 
 - `process`: `path.<path without the leading />` (with `*`),
   `identifier.<TEAM>/<bundle id>`, `script.<path>`, an older plain
-  `/path`, or absent = any process; `via`, the program it runs through,
-  is read in the same forms (its exact form in an export not yet seen)
+  `/path`, or absent = any process; `via`, the program it runs through:
+  `identifier.APPLE/com.apple.ping` for an Apple program, else its plain path
   (`requiresTrustedSignatureForAnyProcess`: "Require: Trusted Code Signature")
 - owner: `uid` = that user's "Me", `owner: "system"`, neither = anyone
 - remote: `remote-domains` / `remote-hosts` / `remote-addresses`, or
