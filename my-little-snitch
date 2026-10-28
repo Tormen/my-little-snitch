@@ -664,8 +664,9 @@ class RuleArgs:
     go: bool = False
     process: str = ""
     remote: str = ""
-    port: str = "443"
+    port: Optional[str] = None
     host: bool = False
+    incoming: bool = False
     owner: Optional[str] = None
     via: Optional[str] = None
 
@@ -690,6 +691,8 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
                 a.owner = v
         elif x == "--host":
             a.host = True
+        elif x == "--incoming":
+            a.incoming = True
         elif x.startswith("-"):
             err("00032", f"no such option for {verb}: '{x}' ({SCRIPT_NAME} --help)")
         else:
@@ -700,6 +703,10 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
     if len(rest) != 2:
         err("00033", f"{verb} [go] <PROCESS> <REMOTE> -- e.g. {SCRIPT_NAME} {verb} aria2c any")
     a.process, a.remote = rest
+    if a.port is None:
+        if a.incoming:      # 443 is where a client connects TO; what a program listens on, only the caller knows
+            err("00054", f"{verb} --incoming: on which port does it listen? --port <N>|any")
+        a.port = "443"
     return a
 
 
@@ -742,6 +749,8 @@ def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Opti
     owner_fields, owner_shown = find_owner(s, a.owner)
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     r: Rule = {"action": action}
+    if a.incoming:
+        r["direction"] = "incoming"
     if prog.process is not None:
         r["process"] = ("script." + prog.path if via and is_script(prog.path)
                         else apple_identity(prog) or prog.process)
@@ -1005,10 +1014,10 @@ RULES
                          allow?[version-path]    works, but breaks on the next
                                                  upgrade: allow its program again
                        FILTER: a part of the line
-  allow [go] <PROCESS> <REMOTE> [--port <N>|any] [--host] [--owner <USER>|anyone|system] [--via <PROGRAM>]
+  allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--host] [--owner <USER>|anyone|system] [--via <PROGRAM>]
   deny  [go] <PROCESS> <REMOTE> ...
-                       shows the outgoing rule it would add; with go, adds it
-                       (one already there is said, not doubled).
+                       shows the rule it would add; with go, adds it (one
+                       already there is said, not doubled).
                          PROCESS  any, a path, or a name found on $PATH
                                   (aria2c). A Homebrew program gets '*' for its
                                   version folder -- Little Snitch's one
@@ -1019,8 +1028,11 @@ RULES
                                   (com.apple.curl), as Little Snitch stores it
                          REMOTE   a domain (and its hosts), a host with
                                   --host, or any
-                         --port   default 443 (tcp); --owner default
-                                  OWNER_DEFAULT
+                         --incoming  a connection TO PROCESS from REMOTE
+                                  (a server: syncthing); without it, outgoing
+                                  from PROCESS to REMOTE
+                         --port   default 443 (tcp), required with
+                                  --incoming; --owner default OWNER_DEFAULT
                          --via    the program PROCESS connects through
                                   (curl, run by a script or by brew), found
                                   like PROCESS; a script PROCESS is then
@@ -1069,6 +1081,7 @@ CONFIG  KEY="value" lines, read and never run -- the first found of
 
 EXAMPLES
   {SCRIPT_NAME} allow /opt/homebrew/bin/python3 api.example.org
+  {SCRIPT_NAME} allow go syncthing any --incoming --port any --owner anyone
   {SCRIPT_NAME} log aria2c --since 1d --denied
   {SCRIPT_NAME} cleanup go"""
 
@@ -1182,6 +1195,7 @@ _{SCRIPT_NAME.replace('-', '_')}() {{
   fi
   case $words[2] in
     allow|deny) _arguments '*:argument:(go any)' '--port[port]:port:' '--host[REMOTE is one host]' \\
+                  '--incoming[a connection to PROCESS]' \\
                   '--owner[owner]:owner:(anyone system)' \\
                   '--via[the program it connects through]:program:_command_names' ;;
     remove|cleanup) _values argument go ;;
@@ -1427,6 +1441,24 @@ def t_allow_shows_then_go(t: T) -> None:
             f"any process, anyone, any port: {new} {errs}")
 
 
+def t_allow_incoming(t: T) -> None:
+    t.passed_roundtrip()
+    rc, _, errs = t.run(["allow", "go", "aria2c", "any", "--port", "any"])
+    t.check(rc == 0 and len(t.rules()) == 6 and "direction" not in t.rules()[-1], f"outgoing first: {errs}")
+    rc, _, errs = t.run(["allow", "aria2c", "any", "--incoming"])
+    t.check(rc == 1 and "--port <N>|any" in errs, f"no port guessed for what a program listens on: {errs}")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "any", "--incoming", "--port", "any"])
+    new = t.rules()[-1]
+    t.check(rc == 0 and "added:" in errs and len(t.rules()) == 7,
+            f"the same rule incoming is another rule, not 'already there': {errs}")
+    t.check(new.get("direction") == "incoming" and new.get("remote") == "any" and "ports" not in new
+            and new.get("process") == f"path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c",
+            f"incoming, any connection, the Homebrew '*' as for outgoing: {new}")
+    t.check("in allow  any  any" in errs, f"shown as list shows it: {errs}")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "any", "--incoming", "--port", "any"])
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 7, f"never doubled: {errs}")
+
+
 def t_apple_is_its_identity(t: T) -> None:
     rc, _, errs = t.run(["allow", "/usr/bin/curl", "example.org"])
     t.check(rc == 0 and "process: identifier.APPLE/com.apple.curl" in errs and "path.usr/bin/curl" not in errs,
@@ -1624,7 +1656,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_apple_is_its_identity, t_allow_via, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]

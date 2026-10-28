@@ -19,7 +19,7 @@ my-little-snitch edits the exported model and restores it -- carefully, see
 ## Commands
 
     my-little-snitch list [<FILTER>]
-    my-little-snitch allow [go] <PROCESS> <REMOTE> [--port <N>|any] [--host] [--owner <USER>|anyone|system] [--via <PROGRAM>]
+    my-little-snitch allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--host] [--owner <USER>|anyone|system] [--via <PROGRAM>]
     my-little-snitch deny  [go] <PROCESS> <REMOTE> ...
     my-little-snitch remove [go] [<ID>..]
     my-little-snitch cleanup [go]
@@ -44,7 +44,7 @@ there is something to do -- one token saying what:
 The ID is a hash of the rule without Little Snitch's counters, so it stays
 the same from one `list` to the next; a changed rule gets a new one.
 
-**allow / deny** -- an outgoing rule. PROCESS is `any`, a path, or a name
+**allow / deny** -- an outgoing rule, or with `--incoming` an incoming one. PROCESS is `any`, a path, or a name
 found on `$PATH` and `PROGRAM_PATH` (`aria2c`). An Apple program is its code
 identity (`identifier.APPLE/com.apple.curl`), as Little Snitch stores it. A
 Homebrew program gets `*`
@@ -66,6 +66,12 @@ A new minor version (`python@3.16`) is another program: allow it again.
 REMOTE is a domain (and its hosts), a host with `--host`, or `any`. `--port`
 defaults to 443 (tcp), `--owner` to `OWNER_DEFAULT`. A rule that is already
 there is said, never doubled.
+
+`--incoming` turns it round: connections TO PROCESS from REMOTE -- a server.
+It needs `--port`, since what a program listens on only the caller knows;
+`--port any` is Little Snitch's "Any incoming connection":
+
+    my-little-snitch allow go syncthing any --incoming --port any --owner anyone
 
 `--via <PROGRAM>` is the program PROCESS connects through -- curl, run by a
 script or by brew -- found the same way as PROCESS and written as Little Snitch stores one (an
