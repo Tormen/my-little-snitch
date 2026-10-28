@@ -620,12 +620,29 @@ def change_model(s: Settings, change: Callable[[List[Rule]], List[Rule]], expect
     return backup
 
 
+def temporary(r: Rule) -> bool:
+    """A temporary rule, live (`lifetime`: untilLogout, ...) or expired
+    (`origin`: expiredTemporary). Little Snitch's restore ends the live ones,
+    turning each into an expired suggestion, and keeps those as it likes."""
+    return "lifetime" in r or r.get("origin") == "expiredTemporary"
+
+
+def say_temporaries(rules: List[Rule]) -> None:
+    """Before a change: the temporary rules it ends -- every change is a restore."""
+    live = [r for r in rules if "lifetime" in r]
+    if live:
+        kinds = ", ".join(sorted({str(r["lifetime"]) for r in live}))
+        OUT.msg(f"    > {len(live)} temporary rule(s) end with this change: "
+                f"Little Snitch's restore expires them [{kinds}]")
+
+
 def expect_rules(want: List[Rule]) -> Callable[[List[Rule]], List[str]]:
     """The check after a restore: the same rules as `want`, by meaning; the
-    dates and counters are Little Snitch's to keep."""
+    dates and counters are Little Snitch's to keep, and so are the temporary
+    rules, which the restore itself ends."""
     def check(now: List[Rule]) -> List[str]:
-        have = sorted(rule_meaning(r) for r in now)
-        asked = sorted(rule_meaning(r) for r in want)
+        have = sorted(rule_meaning(r) for r in now if not temporary(r))
+        asked = sorted(rule_meaning(r) for r in want if not temporary(r))
         if have == asked:
             return []
         missing = [m for m in asked if m not in have]
@@ -781,6 +798,7 @@ def cmd_add(s: Settings, action: str, args: Sequence[str]) -> int:
         OUT.msg(f" >>> already there: {rule_line(same[0])}")
         return 0
     shown = rule_line(r).split("\t", 1)[1]
+    say_temporaries(rules)
     if not a.go:
         OUT.msg(f" >>> would add: {shown}")
         OUT.msg(f"    > '{SCRIPT_NAME} {action} go {shlex.join(args)}' adds it")
@@ -813,6 +831,7 @@ def remove_rules(s: Settings, verb: str, go: bool, pick: Callable[[List[Rule]], 
     if not chosen:
         OUT.msg(" >>> nothing to remove")
         return 0
+    say_temporaries(rules)
     if not go:
         OUT.msg(f" >>> {len(chosen)} rule(s) would be removed -- '{SCRIPT_NAME} {verb} go' removes them")
         return 0
@@ -963,6 +982,7 @@ def cmd_diag(s: Settings, args: Sequence[str]) -> int:
         return 0
     if args[:1] == ["roundtrip"] and args[1:] in ([], ["go"]):
         rules = load_rules(s)
+        say_temporaries(rules)
         if args[1:] != ["go"]:
             OUT.msg(f" >>> would export the {len(rules)} rules, restore them unchanged and compare -- "
                     f"'{SCRIPT_NAME} diag roundtrip go' does it")
@@ -1047,6 +1067,8 @@ RULES
   A change exports the rules (the backup, in BACKUP_DIR), exports again and
   refuses if a rule moved meanwhile, restores, and checks the result. Not
   atomic: a rule Little Snitch itself makes during the restore call is lost.
+  It ends the temporary rules ("until logout"...): the restore expires them,
+  and the change says so first.
   No change before 'diag roundtrip go' has passed on the machine. The check
   proves the rule was STORED, not that it matches: only a connection it lets
   through proves that.
@@ -1293,6 +1315,9 @@ if cmd == "restore-model":
     m = json.load(open(args[-1]))
     if mode("lossy"):
         m["rules"] = m["rules"][1:]
+    for r in m["rules"]:                       # as Little Snitch does: a restore ends the temporary rules
+        if r.pop("lifetime", None):
+            r.update({"action": "suggestion", "origin": "expiredTemporary", "approved": False})
     json.dump(m, open(model, "w")); open(os.path.join(d, "restored"), "a").write("x\n"); sys.exit(0)
 if cmd == "log-traffic":
     sys.stdout.write(open(os.path.join(d, "traffic.csv")).read()); sys.exit(0)
@@ -1533,6 +1558,20 @@ def t_refuse_if_changed(t: T) -> None:
             f"a rule moved between the exports: nothing restored: {errs}")
 
 
+def t_temporary_rules_end(t: T) -> None:
+    t.passed_roundtrip()
+    t.model(t.rules() + [{"action": "allow", "process": "path.opt/x", "remote-domains": "t.org",
+                          "lifetime": "untilLogout", "origin": "alert"}])
+    rc, _, errs = t.run(["allow", "aria2c", "x.org"])
+    t.check(rc == 0 and "1 temporary rule(s) end with this change" in errs,
+            f"said before the change: a restore ends them: {errs}")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
+    t.check(rc == 0 and "added:" in errs and "ERROR" not in errs,
+            f"a temporary rule ended by the restore is not a failed change: {errs}")
+    ended = [r for r in t.rules() if r.get("remote-domains") == "t.org"]
+    t.check(len(ended) == 1 and ended[0]["action"] == "suggestion", f"it ended as Little Snitch ends it: {ended}")
+
+
 def t_verify_after_restore(t: T) -> None:
     t.passed_roundtrip()
     t.mode("lossy")
@@ -1656,7 +1695,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]

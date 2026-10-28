@@ -124,6 +124,10 @@ an alert answered, by you or by its 45 s auto-confirm -- is lost, and step 5
 cannot see it. The backup is the remedy. The counters (`useCount`,
 `lastUsed`) return to their step-1 values.
 
+Every change ends the temporary rules (`lifetime`: `untilLogout`, ...): the
+restore turns each into an expired suggestion (`origin`: `expiredTemporary`).
+The change says how many first, and step 5 leaves them to Little Snitch.
+
 ## The model, as littlesnitch exports it
 
 `rules` is a list of flat dicts:
@@ -137,7 +141,7 @@ cannot see it. The backup is the remedy. The counters (`useCount`,
 - remote: `remote-domains` / `remote-hosts` / `remote-addresses`, or
   `remote: "any"` / `"local-net"`
 - `action`: allow / deny / suggestion; `direction` absent = outgoing
-- `ports`, `protocol`; `origin`, `creationDate`, `modificationDate`;
+- `ports`, `protocol`; `origin`, `creationDate`, `modificationDate`; `lifetime` for a temporary rule;
   `useCount`, `lastUsed` are Little Snitch's own counters
 
 The traffic log is CSV: date (UTC), direction, uid, ipAddress,
