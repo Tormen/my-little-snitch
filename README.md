@@ -30,8 +30,9 @@ Every command that changes rules shows what it would do; with `go` it does it.
 
 **list** -- one line per rule: an ID (6 hex), a TAB (so `cut -f 1` takes
 it), then process (and `via` the program it runs through -- curl, for a
-script that calls it), action, remote, protocol/port, owner, and -- where
-there is something to do -- one token saying what:
+script that calls it), action (`in` or `both` before it when not outgoing),
+remote, protocol/port, owner, and -- where there is something to do -- one
+token saying what:
 
 | token | means |
 |---|---|

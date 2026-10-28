@@ -428,7 +428,7 @@ def verdict(r: Rule) -> str:
 def rule_line(r: Rule) -> str:
     """ID, a TAB (so `cut -f 1` takes it), then the rule; the verdict last."""
     action = str(r.get("action", "?")) + (" (off)" if r.get("disabled") else "")
-    direction = "in " if r.get("direction") == "incoming" else ""
+    direction = {"incoming": "in ", "both": "both "}.get(str(r.get("direction")), "")
     cols = f"{show_process(r)}  {direction}{action}  {show_remote(r)}  {show_port(r)}  {show_owner(r)}"
     v = verdict(r)
     return f"{rule_id(r)}\t{cols}" + (f"   {v}" if v else "")
@@ -1026,7 +1026,8 @@ Little Snitch > Settings > Security > "Allow access via Terminal" on.
 RULES
   list [<FILTER>]      one line per rule: an ID, a TAB, then process
                        (and 'via' the program it runs through, curl for a
-                       script), action, remote, protocol/port, owner -- and,
+                       script), action ('in' or 'both' before it when not
+                       outgoing), remote, protocol/port, owner -- and,
                        where there is something to do, what:
                          cleanup?[never-matches] a '*' where Little Snitch matches none
                          cleanup?[program-gone]  its program, or its via one, no longer exists
@@ -1431,7 +1432,8 @@ def t_list_verdicts(t: T) -> None:
               "remote-domains": "keep.org"},
              {"action": "allow", "process": "script." + str(script), "remote-domains": "keep.org"},
              {"action": "allow", "process": "identifier.APPLE/com.apple.Terminal",
-              "via": "identifier.APPLE/com.apple.curl", "remote": "any"}])
+              "via": "identifier.APPLE/com.apple.curl", "remote": "any"},
+             {"action": "allow", "direction": "both", "remote": "local-net", "owner": "system"}])
     _, out4, _ = t.run(["list"])
     via = out4.splitlines()
     t.check(f"script {script} via {curl}  allow" in via[0] and "cleanup?" not in via[0].replace("version-path", ""),
@@ -1442,6 +1444,8 @@ def t_list_verdicts(t: T) -> None:
     t.check("APPLE/com.apple.Terminal via APPLE/com.apple.curl  allow" in via[3], f"a via code identity: {via[3]}")
     _, out5, _ = t.run(["list", "gone/curl"])
     t.check(out5.splitlines() == [via[1]], f"a FILTER finds the via program: {out5}")
+    t.check(via[4].endswith("any  both allow  local-net  any  system"),
+            f"a both-ways rule (Little Snitch's factory local-net one) says so: {via[4]}")
 
 
 def t_allow_shows_then_go(t: T) -> None:
