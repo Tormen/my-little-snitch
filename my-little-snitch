@@ -1081,7 +1081,9 @@ TRAFFIC
                        out, new connects (when any), DENIED -- bytes with no
                        connects is traffic on an open connection, 0 bytes is
                        nothing moved. A PROCESS (aria2c, a path) matches all its
-                       versions; anything else is a part of the line
+                       versions; anything else is a part of the line.
+                       --since reaches as far back as Little Snitch keeps:
+                       on ada, 14 months (2025-08-13 on 2026-10-28)
 
 ADMIN
   diag roundtrip [go]  export, restore unchanged, compare -- needed once

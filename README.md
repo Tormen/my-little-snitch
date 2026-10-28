@@ -97,6 +97,9 @@ of it, as the connecting program or the app around it; anything else is a
 part of the line. `--denied`: only lines with a denial. `-V` adds the full
 path.
 
+`--since` reaches as far back as Little Snitch keeps the log: on ada, 14
+months (back to 2025-08-13 on 2026-10-28, 3 million lines).
+
     my-little-snitch log aria2c --since 1d --denied
 
 **diag events** -- Little Snitch's own messages (`littlesnitch log`).
