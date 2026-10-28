@@ -696,9 +696,9 @@ def lagging(rules: List[Rule], shown: List[Rule]) -> Dict[Tuple[str, str], List[
 
 def allow_line(r: Rule, path: str) -> Optional[str]:
     """The allow/deny command that adds this rule, or None when it says
-    something allow cannot (udp, addresses, local-net, a port list, both ways)."""
+    something allow cannot (addresses, local-net, a port list, both ways)."""
     owner = show_owner(r)
-    if (r.get("protocol") not in (None, "tcp") or r.get("direction") == "both" or owner.startswith("uid ")
+    if (r.get("protocol") not in (None, "tcp", "udp") or r.get("direction") == "both" or owner.startswith("uid ")
             or str(r.get("via", "/")).startswith("identifier.")):
         return None
     if r.get("remote") == "any":
@@ -715,6 +715,7 @@ def allow_line(r: Rule, path: str) -> Optional[str]:
     words = [SCRIPT_NAME, str(r["action"]), "go", path, *remote]
     words += ["--incoming"] if r.get("direction") == "incoming" else []
     words += ["--port", port, "--owner", owner]
+    words += ["--udp"] if r.get("protocol") == "udp" else []
     words += ["--via", show_program(r["via"])] if "via" in r else []
     return shlex.join(words)
 
@@ -746,6 +747,7 @@ class RuleArgs:
     port: Optional[str] = None
     host: bool = False
     incoming: bool = False
+    udp: bool = False
     owner: Optional[str] = None
     via: Optional[str] = None
 
@@ -772,6 +774,8 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
             a.host = True
         elif x == "--incoming":
             a.incoming = True
+        elif x == "--udp":
+            a.udp = True
         elif x.startswith("-"):
             err("00033", f"no such option for {verb}: '{x}' ({SCRIPT_NAME} --help)")
         else:
@@ -785,6 +789,8 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
     if a.port is None:
         if a.incoming:      # 443 is where a client connects TO; what a program listens on, only the caller knows
             err("00035", f"{verb} --incoming: on which port does it listen? --port <N>|any")
+        if a.udp:           # 443 is tcp's default; a udp service (dns 53, ntp 123) has its own
+            err("00054", f"{verb} --udp: which port? --port <N>|any (dns is 53)")
         a.port = "443"
     return a
 
@@ -841,7 +847,9 @@ def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Opti
     else:
         r["remote-hosts" if a.host else "remote-domains"] = a.remote
     if a.port != "any":
-        r["ports"], r["protocol"] = a.port, "tcp"
+        r["ports"], r["protocol"] = a.port, "udp" if a.udp else "tcp"
+    elif a.udp:
+        r["protocol"] = "udp"
     r.update(owner_fields)
     r.update({"origin": "frontend", "creationDate": now, "modificationDate": now})
     return r, prog, via, owner_shown
@@ -1101,7 +1109,7 @@ RULES
                        Then, for a newer Homebrew version installed beside
                        the one the rules name (python@3.16, rules for 3.15
                        only), the allow go lines that carry them over
-  allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--host] [--owner <USER>|anyone|system] [--via <PROGRAM>]
+  allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--udp] [--host] [--owner <USER>|anyone|system] [--via <PROGRAM>]
   deny  [go] <PROCESS> <REMOTE> ...
                        shows the rule it would add; with go, adds it (one
                        already there is said, not doubled).
@@ -1119,7 +1127,8 @@ RULES
                                   (a server: syncthing); without it, outgoing
                                   from PROCESS to REMOTE
                          --port   default 443 (tcp), required with
-                                  --incoming; --owner default OWNER_DEFAULT
+                                  --incoming and with --udp (the protocol
+                                  then: dns 53); --owner default OWNER_DEFAULT
                          --via    the program PROCESS connects through
                                   (curl, run by a script or by brew), found
                                   like PROCESS; a script PROCESS is then
@@ -1592,6 +1601,24 @@ def t_allow_via(t: T) -> None:
     t.check(rc == 1 and "--via needs a value" in errs, errs)
 
 
+def t_allow_udp(t: T) -> None:
+    t.passed_roundtrip()
+    rc, _, errs = t.run(["allow", "go", "/usr/bin/curl", "example.org", "--udp"])
+    t.check(rc == 1 and "--udp: which port" in errs and len(t.rules()) == 5,
+            f"--udp names no default port -- 443 is tcp's: refused, nothing added: {errs}")
+    rc, _, errs = t.run(["allow", "go", "/usr/bin/curl", "example.org", "--udp", "--port", "53"])
+    new = t.rules()[-1]
+    t.check(rc == 0 and "added:" in errs and new.get("protocol") == "udp" and new.get("ports") == "53",
+            f"udp/53 written as Little Snitch stores it: {new} {errs}")
+    rc, _, errs = t.run(["allow", "go", "/usr/bin/curl", "example.org", "--port", "53"])
+    t.check(rc == 0 and "added:" in errs and t.rules()[-1].get("protocol") == "tcp",
+            f"the same port over tcp is another rule, never 'already there': {errs}")
+    rc, _, errs = t.run(["allow", "go", "/usr/bin/curl", "example.org", "--udp", "--port", "53"])
+    t.check(rc == 0 and "already there" in errs, f"the udp one again: said, never doubled: {errs}")
+    t.check(allow_line(new, "/usr/bin/curl") is not None and "--udp" in (allow_line(new, "/usr/bin/curl") or ""),
+            f"list can print the allow line of a udp rule now: {allow_line(new, '/usr/bin/curl')}")
+
+
 def t_list_lagging_versions(t: T) -> None:
     t.passed_roundtrip()
 
@@ -1610,16 +1637,16 @@ def t_list_lagging_versions(t: T) -> None:
               "protocol": "tcp", "uid": t.uid},
              {"action": "allow", "process": "path." + new[1:], "remote-domains": "keep.org", "ports": "443",
               "protocol": "tcp", "uid": t.uid},
-             {"action": "allow", "process": "path." + old[1:], "remote": "any", "ports": "53", "protocol": "udp",
-              "owner": "system"}])
+             {"action": "allow", "process": "path." + old[1:], "remote-addresses": "192.0.2.1", "ports": "53",
+              "protocol": "udp", "owner": "system"}])
     rc, out, errs = t.run(["list"])
     lines = [x for x in errs.splitlines() if x.startswith("   > ")]
     t.check(rc == 0 and len(out.splitlines()) == 4, f"the rules themselves, unchanged: {out}")
     t.check("python@3.16 is installed; 2 rule(s) only for python@3.15" in errs, f"the lag, counted: {errs}")
     want = f"   > my-little-snitch allow go {shlex.quote(new)} pypi.org --port 443 --owner {t.user}"
     t.check(lines[:1] == [want], f"the allow line for the newer Python, its Versions/ too: {lines}")
-    t.check(len(lines) == 2 and "udp/53" in lines[1] and "add it in Little Snitch" in lines[1]
-            and "allow go" not in lines[1], f"udp is not allow's: shown, never a wrong command: {lines}")
+    t.check(len(lines) == 2 and "192.0.2.1" in lines[1] and "add it in Little Snitch" in lines[1]
+            and "allow go" not in lines[1], f"an address is not allow's: shown, never a wrong command: {lines}")
     t.check("keep.org" not in "".join(lines), "a rule the newer one already has is not suggested")
     t.check("3.14" not in errs, f"an older installed version is not suggested: {errs}")
     rc, _, errs = t.run(shlex.split(want[len("   > my-little-snitch "):]))
@@ -1806,7 +1833,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_udp, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]

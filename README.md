@@ -19,7 +19,7 @@ my-little-snitch edits the exported model and restores it -- carefully, see
 ## Commands
 
     my-little-snitch list [<FILTER>]
-    my-little-snitch allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--host] [--owner <USER>|anyone|system] [--via <PROGRAM>]
+    my-little-snitch allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--udp] [--host] [--owner <USER>|anyone|system] [--via <PROGRAM>]
     my-little-snitch deny  [go] <PROCESS> <REMOTE> ...
     my-little-snitch remove [go] [<ID>..]
     my-little-snitch cleanup [go]
@@ -45,8 +45,8 @@ token saying what:
 When a newer version of a versioned Homebrew formula is installed beside
 the one its rules name (`python@3.16`, rules for `python@3.15` only), `list`
 prints, under the rules shown, the `allow go` line for each rule the new one
-lacks. A rule `allow` cannot write (udp, addresses, `local-net`, a port
-list) is shown instead, to add in Little Snitch.
+lacks. A rule `allow` cannot write (addresses, `local-net`, a port list) is
+shown instead, to add in Little Snitch.
 
 The ID is a hash of the rule without Little Snitch's counters, so it stays
 the same from one `list` to the next; a changed rule gets a new one.
@@ -71,7 +71,8 @@ stored by `restore-model` and never matches, so my-little-snitch refuses it.
 A new minor version (`python@3.16`) is another program: allow it again.
 
 REMOTE is a domain (and its hosts), a host with `--host`, or `any`. `--port`
-defaults to 443 (tcp), `--owner` to `OWNER_DEFAULT`. A rule that is already
+defaults to 443 (tcp), `--owner` to `OWNER_DEFAULT`. `--udp` makes it a udp rule; it
+needs `--port` (dns is 53), since 443 is tcp's default. A rule that is already
 there is said, never doubled.
 
 `--incoming` turns it round: connections TO PROCESS from REMOTE -- a server.
