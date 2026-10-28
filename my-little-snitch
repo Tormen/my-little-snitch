@@ -667,6 +667,7 @@ class RuleArgs:
     port: str = "443"
     host: bool = False
     owner: Optional[str] = None
+    via: Optional[str] = None
 
 
 def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
@@ -675,7 +676,7 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
     it = iter(args)
     for x in it:
         key, eq, val = x.partition("=")
-        if key in ("--port", "--owner"):
+        if key in ("--port", "--owner", "--via"):
             v = val if eq else next(it, None)
             if not v:
                 err("00030", f"{key} needs a value")
@@ -683,6 +684,8 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
                 if v != "any" and not re.fullmatch(r"\d+(-\d+)?", v):
                     err("00031", f"--port '{v}': a number, a range like 6881-6889, or any")
                 a.port = v
+            elif key == "--via":
+                a.via = v
             else:
                 a.owner = v
         elif x == "--host":
@@ -700,13 +703,27 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
     return a
 
 
-def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, str]:
+def is_script(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"#!"
+    except OSError:
+        return False
+
+
+def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Optional[Program], str]:
+    """The rule as Little Snitch's alert writes it. With a via program (curl,
+    run by a script), a script PROCESS is named `script.<path>`, as Little
+    Snitch names the scripts it shows "via" something."""
     prog = find_program(s, a.process)
+    via = find_program(s, a.via) if a.via else None
     owner_fields, owner_shown = find_owner(s, a.owner)
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     r: Rule = {"action": action}
     if prog.process is not None:
-        r["process"] = prog.process
+        r["process"] = "script." + prog.path if via and is_script(prog.path) else prog.process
+    if via and via.process is not None:
+        r["via"] = via.process
     if a.remote == "any":
         r["remote"] = "any"
     else:
@@ -715,16 +732,17 @@ def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, str]
         r["ports"], r["protocol"] = a.port, "tcp"
     r.update(owner_fields)
     r.update({"origin": "frontend", "creationDate": now, "modificationDate": now})
-    return r, prog, owner_shown
+    return r, prog, via, owner_shown
 
 
 def cmd_add(s: Settings, action: str, args: Sequence[str]) -> int:
     a = parse_rule_args(action, args)
-    r, prog, _ = new_rule(s, action, a)
-    if prog.process is not None:
-        OUT.msg(f" >>> process: {prog.process}")
-        if prog.note:
-            OUT.msg(f"    > {prog.note}")
+    r, prog, via, _ = new_rule(s, action, a)
+    for label, p in (("process", prog), ("via", via)):
+        if p is not None and p.process is not None:
+            OUT.msg(f" >>> {label}: {r[label]}")
+            if p.note:
+                OUT.msg(f"    > {p.note}")
     rules = load_rules(s)
     same = [x for x in rules if rule_meaning(x) == rule_meaning(r)]
     if same:
@@ -739,7 +757,7 @@ def cmd_add(s: Settings, action: str, args: Sequence[str]) -> int:
     backup = change_model(s, lambda now: now + [r], expect_rules(want))
     OUT.msg(f" >>> added: {shown}  [rules {len(rules)} -> {len(want)}]")
     OUT.msg(f"    > stored and read back -- proven only by a connection it lets through: "
-            f"{SCRIPT_NAME} log {shlex.quote(a.remote if a.process == 'any' else a.process)}")
+            f"{SCRIPT_NAME} log {shlex.quote(a.via or (a.remote if a.process == 'any' else a.process))}")
     OUT.det(f"    > the rules before: {backup}")
     return 0
 
@@ -964,7 +982,7 @@ RULES
                          allow?[version-path]    works, but breaks on the next
                                                  upgrade: allow its program again
                        FILTER: a part of the line
-  allow [go] <PROCESS> <REMOTE> [--port <N>|any] [--host] [--owner <USER>|anyone|system]
+  allow [go] <PROCESS> <REMOTE> [--port <N>|any] [--host] [--owner <USER>|anyone|system] [--via <PROGRAM>]
   deny  [go] <PROCESS> <REMOTE> ...
                        shows the outgoing rule it would add; with go, adds it
                        (one already there is said, not doubled).
@@ -978,6 +996,10 @@ RULES
                                   --host, or any
                          --port   default 443 (tcp); --owner default
                                   OWNER_DEFAULT
+                         --via    the program PROCESS connects through
+                                  (curl, run by a script or by brew), found
+                                  like PROCESS; a script PROCESS is then
+                                  named as Little Snitch names one
   remove [go] [<ID>..] shows the rules; with go, removes them. IDs as
                        arguments or one per line on stdin:
                          {SCRIPT_NAME} list python@3.10 | cut -f 1 | {SCRIPT_NAME} remove go
@@ -1135,7 +1157,8 @@ _{SCRIPT_NAME.replace('-', '_')}() {{
   fi
   case $words[2] in
     allow|deny) _arguments '*:argument:(go any)' '--port[port]:port:' '--host[REMOTE is one host]' \\
-                  '--owner[owner]:owner:(anyone system)' ;;
+                  '--owner[owner]:owner:(anyone system)' \\
+                  '--via[the program it connects through]:program:_command_names' ;;
     remove|cleanup) _values argument go ;;
     log) _arguments '1:program:_command_names' '--since[since]:time:(30m 1h 6h 1d 7d)' '--denied[denied only]' ;;
     diag) _values check roundtrip events ;;
@@ -1379,6 +1402,28 @@ def t_allow_shows_then_go(t: T) -> None:
             f"any process, anyone, any port: {new} {errs}")
 
 
+def t_allow_via(t: T) -> None:
+    t.passed_roundtrip()
+    script = t.dir / "fetch.sh"
+    script.write_text("#!/bin/sh\ncurl https://example.org\n")
+    rc, _, errs = t.run(["allow", "go", str(script), "example.org"])
+    t.check(rc == 0 and len(t.rules()) == 6 and "via" not in t.rules()[-1], f"without --via, no via: {errs}")
+    rc, _, errs = t.run(["allow", str(script), "example.org", "--via", "aria2c"])
+    star = f"{t.cellar}/aria2/*/bin/aria2c"
+    t.check(rc == 0 and f"would add: script {script} via {star}  allow" in errs and len(t.rules()) == 6,
+            f"shown with its via, nothing changed: {errs}")
+    rc, _, errs = t.run(["allow", "go", str(script), "example.org", "--via=aria2c"])
+    new = t.rules()[-1]
+    t.check(rc == 0 and "added:" in errs and len(t.rules()) == 7,
+            f"the same rule with a via is another rule, not 'already there': {errs}")
+    t.check(new.get("process") == f"script.{script}" and new.get("via") == "path." + star[1:],
+            f"a script as Little Snitch names one, its via as a program: {new}")
+    t.check("connection it lets through: my-little-snitch log aria2c" in errs,
+            f"the proof is the via program's log -- it is what connects: {errs}")
+    rc, _, errs = t.run(["allow", str(script), "example.org", "--via"])
+    t.check(rc == 1 and "--via needs a value" in errs, errs)
+
+
 def t_python_is_its_app(t: T) -> None:
     fw = t.cellar / "python@3.15" / "3.15.0" / "Frameworks" / "Python.framework" / "Versions" / "3.15"
     (fw / "bin").mkdir(parents=True)
@@ -1541,7 +1586,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_via, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]

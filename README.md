@@ -19,7 +19,7 @@ my-little-snitch edits the exported model and restores it -- carefully, see
 ## Commands
 
     my-little-snitch list [<FILTER>]
-    my-little-snitch allow [go] <PROCESS> <REMOTE> [--port <N>|any] [--host] [--owner <USER>|anyone|system]
+    my-little-snitch allow [go] <PROCESS> <REMOTE> [--port <N>|any] [--host] [--owner <USER>|anyone|system] [--via <PROGRAM>]
     my-little-snitch deny  [go] <PROCESS> <REMOTE> ...
     my-little-snitch remove [go] [<ID>..]
     my-little-snitch cleanup [go]
@@ -64,6 +64,13 @@ A new minor version (`python@3.16`) is another program: allow it again.
 REMOTE is a domain (and its hosts), a host with `--host`, or `any`. `--port`
 defaults to 443 (tcp), `--owner` to `OWNER_DEFAULT`. A rule that is already
 there is said, never doubled.
+
+`--via <PROGRAM>` is the program PROCESS connects through -- curl, run by a
+script or by brew -- found the same way as PROCESS. A script PROCESS is then
+`script.<path>`, as Little Snitch names the scripts it shows "via" something.
+The rule's proof is the via program's log (`log curl`): it is what connects.
+
+    my-little-snitch allow go /usr/local/bin/fetch.sh example.org --via curl
 
 **remove** -- by ID, as arguments or one per line on stdin:
 
