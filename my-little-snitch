@@ -664,15 +664,77 @@ def load_rules(s: Settings) -> List[Rule]:
             tmp.unlink()
 
 
+def version_key(v: str) -> Tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+def lagging(rules: List[Rule], shown: List[Rule]) -> Dict[Tuple[str, str], List[Tuple[Rule, str]]]:
+    """The shown rules of a versioned Homebrew formula (python@3.15) that a
+    NEWER installed one (python@3.16) has no twin of -- keyed by (old, new),
+    each with its twin and the twin's program path."""
+    have = {rule_meaning(r) for r in rules}
+    found: Dict[Tuple[str, str], List[Tuple[Rule, str]]] = {}
+    for r in shown:
+        if r.get("action") not in ("allow", "deny"):
+            continue
+        process = str(r.get("process", ""))
+        prefix = next((p for p in ("path.", "script.") if process.startswith(p)), None)
+        m = _CELLAR.match("/" + process[len(prefix):].lstrip("/")) if prefix else None
+        if m is None or not m.group("at") or m.group("ver") != "*":
+            continue
+        formula, old = m.group("formula"), m.group("at")[1:]
+        for folder in sorted(glob.glob(f"{m.group('pre')}{formula}@*")):
+            new = folder.rsplit("@", 1)[1]
+            if version_key(new) <= version_key(old):
+                continue
+            path = f"{m.group('pre')}{formula}@{new}/*/{m.group('rest').replace(old, new)}"
+            twin = dict(r, process=("path." + path[1:] if prefix == "path." else "script." + path))
+            if glob.glob(path) and rule_meaning(twin) not in have:
+                found.setdefault((f"{formula}@{old}", f"{formula}@{new}"), []).append((twin, path))
+    return found
+
+
+def allow_line(r: Rule, path: str) -> Optional[str]:
+    """The allow/deny command that adds this rule, or None when it says
+    something allow cannot (udp, addresses, local-net, a port list, both ways)."""
+    owner = show_owner(r)
+    if (r.get("protocol") not in (None, "tcp") or r.get("direction") == "both" or owner.startswith("uid ")
+            or str(r.get("via", "/")).startswith("identifier.")):
+        return None
+    if r.get("remote") == "any":
+        remote = ["any"]
+    elif "remote-domains" in r:
+        remote = [str(r["remote-domains"])]
+    elif "remote-hosts" in r:
+        remote = [str(r["remote-hosts"]), "--host"]
+    else:
+        return None
+    port = str(r.get("ports", "any"))
+    if "," in remote[0] or not re.fullmatch(r"any|\d+(-\d+)?", port):
+        return None
+    words = [SCRIPT_NAME, str(r["action"]), "go", path, *remote]
+    words += ["--incoming"] if r.get("direction") == "incoming" else []
+    words += ["--port", port, "--owner", owner]
+    words += ["--via", show_program(r["via"])] if "via" in r else []
+    return shlex.join(words)
+
+
 def cmd_list(s: Settings, args: Sequence[str]) -> int:
     if len(args) > 1:
         err("00030", "list takes one <FILTER> at most")
     rules = load_rules(s)
-    shown = [line for line in (rule_line(r) for r in rules) if not args or args[0] in line]
+    picked = [r for r in rules if not args or args[0] in rule_line(r)]
+    shown = [rule_line(r) for r in picked]
     for line in shown:
         OUT.result(line)
     todo = sum(1 for line in shown if "cleanup?[" in line)
     OUT.msg(f" >>> {len(shown)} of {len(rules)} rule(s)" + (f"; {todo} outdated -- '{SCRIPT_NAME} cleanup' shows them" if todo else ""))
+    for (old, new), twins in lagging(rules, picked).items():
+        OUT.msg(f" >>> {new} is installed; {len(twins)} rule(s) only for {old} -- to carry them over:")
+        for twin, path in twins:
+            line = allow_line(twin, path)
+            OUT.msg(f"   > {line}" if line else
+                    f"   > {rule_line(twin).split(chr(9), 1)[1]}   (not allow's to write: add it in Little Snitch)")
     return 0
 
 
@@ -1036,6 +1098,9 @@ RULES
                          allow?[version-path]    works, but breaks on the next
                                                  upgrade: allow its program again
                        FILTER: a part of the line
+                       Then, for a newer Homebrew version installed beside
+                       the one the rules name (python@3.16, rules for 3.15
+                       only), the allow go lines that carry them over
   allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--host] [--owner <USER>|anyone|system] [--via <PROGRAM>]
   deny  [go] <PROCESS> <REMOTE> ...
                        shows the rule it would add; with go, adds it (one
@@ -1527,6 +1592,44 @@ def t_allow_via(t: T) -> None:
     t.check(rc == 1 and "--via needs a value" in errs, errs)
 
 
+def t_list_lagging_versions(t: T) -> None:
+    t.passed_roundtrip()
+
+    def python(v: str) -> str:
+        app = (t.cellar / f"python@{v}" / f"{v}.0" / "Frameworks" / "Python.framework" / "Versions" / v
+               / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python")
+        app.parent.mkdir(parents=True)
+        app.write_text("x")
+        return f"{t.cellar}/python@{v}/*/Frameworks/Python.framework/Versions/{v}/Resources/Python.app/Contents/MacOS/Python"
+
+    old, new = python("3.15"), python("3.16")
+    python("3.14")     # an older one installed too
+    t.model([{"action": "allow", "process": "path." + old[1:], "remote-domains": "pypi.org", "ports": "443",
+              "protocol": "tcp", "uid": t.uid},
+             {"action": "allow", "process": "path." + old[1:], "remote-domains": "keep.org", "ports": "443",
+              "protocol": "tcp", "uid": t.uid},
+             {"action": "allow", "process": "path." + new[1:], "remote-domains": "keep.org", "ports": "443",
+              "protocol": "tcp", "uid": t.uid},
+             {"action": "allow", "process": "path." + old[1:], "remote": "any", "ports": "53", "protocol": "udp",
+              "owner": "system"}])
+    rc, out, errs = t.run(["list"])
+    lines = [x for x in errs.splitlines() if x.startswith("   > ")]
+    t.check(rc == 0 and len(out.splitlines()) == 4, f"the rules themselves, unchanged: {out}")
+    t.check("python@3.16 is installed; 2 rule(s) only for python@3.15" in errs, f"the lag, counted: {errs}")
+    want = f"   > my-little-snitch allow go {shlex.quote(new)} pypi.org --port 443 --owner {t.user}"
+    t.check(lines[:1] == [want], f"the allow line for the newer Python, its Versions/ too: {lines}")
+    t.check(len(lines) == 2 and "udp/53" in lines[1] and "add it in Little Snitch" in lines[1]
+            and "allow go" not in lines[1], f"udp is not allow's: shown, never a wrong command: {lines}")
+    t.check("keep.org" not in "".join(lines), "a rule the newer one already has is not suggested")
+    t.check("3.14" not in errs, f"an older installed version is not suggested: {errs}")
+    rc, _, errs = t.run(shlex.split(want[len("   > my-little-snitch "):]))
+    t.check(rc == 0 and "added:" in errs, f"the suggested line works as written: {errs}")
+    _, _, errs = t.run(["list", "pypi"])
+    t.check("is installed" not in errs, f"once added, nothing lags: {errs}")
+    _, _, errs = t.run(["list", "keep.org"])
+    t.check("is installed" not in errs, f"only the rules shown are looked at: {errs}")
+
+
 def t_python_is_its_app(t: T) -> None:
     fw = t.cellar / "python@3.15" / "3.15.0" / "Frameworks" / "Python.framework" / "Versions" / "3.15"
     (fw / "bin").mkdir(parents=True)
@@ -1703,7 +1806,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]

@@ -42,6 +42,12 @@ token saying what:
 | `cleanup?[expired]` | an expired temporary rule (Little Snitch's "suggestion") |
 | `allow?[version-path]` | works, but names one Homebrew version: breaks on the next upgrade -- `allow go` its program again, then `remove go` this one |
 
+When a newer version of a versioned Homebrew formula is installed beside
+the one its rules name (`python@3.16`, rules for `python@3.15` only), `list`
+prints, under the rules shown, the `allow go` line for each rule the new one
+lacks. A rule `allow` cannot write (udp, addresses, `local-net`, a port
+list) is shown instead, to add in Little Snitch.
+
 The ID is a hash of the rule without Little Snitch's counters, so it stays
 the same from one `list` to the next; a changed rule gets a new one.
 
