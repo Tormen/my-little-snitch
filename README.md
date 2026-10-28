@@ -45,7 +45,9 @@ The ID is a hash of the rule without Little Snitch's counters, so it stays
 the same from one `list` to the next; a changed rule gets a new one.
 
 **allow / deny** -- an outgoing rule. PROCESS is `any`, a path, or a name
-found on `$PATH` and `PROGRAM_PATH` (`aria2c`). A Homebrew program gets `*`
+found on `$PATH` and `PROGRAM_PATH` (`aria2c`). An Apple program is its code
+identity (`identifier.APPLE/com.apple.curl`), as Little Snitch stores it. A
+Homebrew program gets `*`
 for its version folder, as Little Snitch's own alert writes it -- and a
 Python is its `Python.app`, which is what connects -- so the rule survives
 upgrades:

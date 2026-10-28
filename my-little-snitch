@@ -711,10 +711,10 @@ def is_script(path: str) -> bool:
         return False
 
 
-def via_form(p: Program) -> str:
-    """A via program as Little Snitch stores one: an Apple platform binary by
-    its code identity (`identifier.APPLE/com.apple.ping`), anything else by
-    its plain path -- never `path.`, which it uses for a process only."""
+def apple_identity(p: Program) -> Optional[str]:
+    """An Apple platform binary's code identity, as Little Snitch stores one
+    -- `identifier.APPLE/com.apple.curl` for /usr/bin/curl, as process or as
+    via -- and None for anything else."""
     files = glob.glob(p.path) if "*" in p.path else [p.path]
     try:
         cs = subprocess.run(["/usr/bin/codesign", "-dv", files[0]], capture_output=True, text=True,
@@ -724,7 +724,13 @@ def via_form(p: Program) -> str:
     ident = re.search(r"^Identifier=(\S+)$", cs, re.M)
     if ident and re.search(r"^Platform identifier=", cs, re.M):
         return f"identifier.APPLE/{ident.group(1)}"
-    return p.path
+    return None
+
+
+def via_form(p: Program) -> str:
+    """A via program as Little Snitch stores one: its Apple identity, else its
+    plain path -- never `path.`, which it uses for a process only."""
+    return apple_identity(p) or p.path
 
 
 def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Optional[Program], str]:
@@ -737,7 +743,8 @@ def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Opti
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     r: Rule = {"action": action}
     if prog.process is not None:
-        r["process"] = "script." + prog.path if via and is_script(prog.path) else prog.process
+        r["process"] = ("script." + prog.path if via and is_script(prog.path)
+                        else apple_identity(prog) or prog.process)
     if via and via.process is not None:
         r["via"] = via_form(via)
     if a.remote == "any":
@@ -1007,7 +1014,9 @@ RULES
                                   version folder -- Little Snitch's one
                                   wildcard -- and a Python is its Python.app,
                                   so upgrades keep the rule (a new python@3.16
-                                  is another program: allow it again)
+                                  is another program: allow it again). An
+                                  Apple program is its code identity
+                                  (com.apple.curl), as Little Snitch stores it
                          REMOTE   a domain (and its hosts), a host with
                                   --host, or any
                          --port   default 443 (tcp); --owner default
@@ -1418,6 +1427,16 @@ def t_allow_shows_then_go(t: T) -> None:
             f"any process, anyone, any port: {new} {errs}")
 
 
+def t_apple_is_its_identity(t: T) -> None:
+    rc, _, errs = t.run(["allow", "/usr/bin/curl", "example.org"])
+    t.check(rc == 0 and "process: identifier.APPLE/com.apple.curl" in errs and "path.usr/bin/curl" not in errs,
+            f"an Apple program is its code identity, as Little Snitch stores curl: {errs}")
+    t.check("would add: APPLE/com.apple.curl  allow  example.org" in errs, f"and shown so: {errs}")
+    rc, _, errs = t.run(["allow", "aria2c", "example.org"])
+    t.check(rc == 0 and f"process: path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c" in errs,
+            f"anything else keeps its path: {errs}")
+
+
 def t_allow_via(t: T) -> None:
     t.passed_roundtrip()
     script = t.dir / "fetch.sh"
@@ -1605,7 +1624,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_via, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed,
+    t_list_verdicts, t_allow_shows_then_go, t_apple_is_its_identity, t_allow_via, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]
