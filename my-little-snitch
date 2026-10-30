@@ -37,7 +37,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Final, Generator, List, NoReturn, Optional, Sequence, Tuple, cast
+from typing import Callable, Dict, Final, Generator, List, Literal, NoReturn, Optional, Sequence, Tuple, cast
 
 SCRIPT_NAME: Final = "my-little-snitch"
 SCRIPT_VERSION: Final = "1.0"
@@ -698,21 +698,23 @@ def lagging(rules: List[Rule], shown: List[Rule]) -> Dict[Tuple[str, str], List[
 
 def allow_line(r: Rule, path: str) -> Optional[str]:
     """The allow/deny command that adds this rule, or None when it says
-    something allow cannot (addresses, local-net, a port list, both ways)."""
+    something allow cannot (a list of domains or hosts, a port list, both ways)."""
     owner = show_owner(r)
     if (r.get("protocol") not in (None, "tcp", "udp") or r.get("direction") == "both" or owner.startswith("uid ")
             or str(r.get("via", "/")).startswith("identifier.")):
         return None
-    if r.get("remote") == "any":
-        remote = ["any"]
+    if r.get("remote") in REMOTE_WORDS:
+        remote = [str(r["remote"])]
     elif "remote-domains" in r:
         remote = [str(r["remote-domains"])]
     elif "remote-hosts" in r:
         remote = [str(r["remote-hosts"]), "--host"]
+    elif "remote-addresses" in r:
+        remote = [str(r["remote-addresses"]), "--address"]
     else:
         return None
     port = str(r.get("ports", "any"))
-    if "," in remote[0] or not re.fullmatch(r"any|\d+(-\d+)?", port):
+    if ("," in remote[0] and remote[1:] != ["--address"]) or not re.fullmatch(r"any|\d+(-\d+)?", port):
         return None
     words = [SCRIPT_NAME, str(r["action"]), "go", path, *remote]
     words += ["--incoming"] if r.get("direction") == "incoming" else []
@@ -741,13 +743,39 @@ def cmd_list(s: Settings, args: Sequence[str]) -> int:
     return 0
 
 
+REMOTE_WORDS: Final = ("any", "local-net")     # a REMOTE that is Little Snitch's `remote` itself
+RemoteKind = Literal["domains", "hosts", "addresses"]
+KIND_FLAGS: Final[Dict[str, RemoteKind]] = {"--host": "hosts", "--address": "addresses"}
+_ADDRESS: Final = re.compile(r"[0-9A-Fa-f:.*/-]*[.:][0-9A-Fa-f:.*/-]*")
+
+
+def remote_of(verb: str, remote: str, flags: List[str]) -> Tuple[RemoteKind, str]:
+    """REMOTE and the flags that say what it is, as Little Snitch stores the
+    rule's remote: one kind per rule. An address list is written `a, b`, as
+    Little Snitch writes one, so the same list is found as the same rule."""
+    kinds = sorted(set(flags))
+    if len(kinds) > 1 or (kinds and remote in REMOTE_WORDS):
+        err("00055", f"{verb}: one remote per rule -- a domain, a host (--host), addresses (--address), "
+                     f"any or local-net; not '{remote}' with {' '.join(kinds)}")
+    kind: RemoteKind = KIND_FLAGS[kinds[0]] if kinds else "domains"
+    if kind == "addresses":
+        items = [x.strip() for x in remote.split(",")]
+        if not all(_ADDRESS.fullmatch(x) for x in items):
+            err("00056", f"--address '{remote}': an address, a pattern (192.168.192.*) or a list (a, b)")
+        return kind, ", ".join(items)
+    if ":" in remote or re.fullmatch(r"[0-9.*/-]*\.[0-9.*/-]*", remote):
+        # 10.0.0.1 or 192.168.192.* as a domain is a rule that never matches
+        err("00057", f"'{remote}' is an address, not a {kind[:-1]} -- add --address")
+    return kind, remote
+
+
 @dataclass
 class RuleArgs:
     go: bool = False
     process: str = ""
     remote: str = ""
+    kind: RemoteKind = "domains"
     port: Optional[str] = None
-    host: bool = False
     incoming: bool = False
     udp: bool = False
     owner: Optional[str] = None
@@ -757,6 +785,7 @@ class RuleArgs:
 def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
     a = RuleArgs()
     rest: List[str] = []
+    kind_flags: List[str] = []
     it = iter(args)
     for x in it:
         key, eq, val = x.partition("=")
@@ -772,8 +801,8 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
                 a.via = v
             else:
                 a.owner = v
-        elif x == "--host":
-            a.host = True
+        elif x in KIND_FLAGS:
+            kind_flags.append(x)
         elif x == "--incoming":
             a.incoming = True
         elif x == "--udp":
@@ -787,7 +816,8 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
         rest = rest[1:]
     if len(rest) != 2:
         err("00034", f"{verb} [go] <PROCESS> <REMOTE> -- e.g. {SCRIPT_NAME} {verb} aria2c any")
-    a.process, a.remote = rest
+    a.process = rest[0]
+    a.kind, a.remote = remote_of(verb, rest[1], kind_flags)
     if a.port is None:
         if a.incoming:      # 443 is where a client connects TO; what a program listens on, only the caller knows
             err("00035", f"{verb} --incoming: on which port does it listen? --port <N>|any")
@@ -844,10 +874,10 @@ def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Opti
                         else stored_form(prog))
     if via and via.process is not None:
         r["via"] = stored_form(via)
-    if a.remote == "any":
-        r["remote"] = "any"
+    if a.remote in REMOTE_WORDS:
+        r["remote"] = a.remote
     else:
-        r["remote-hosts" if a.host else "remote-domains"] = a.remote
+        r[f"remote-{a.kind}"] = a.remote
     if a.port != "any":
         r["ports"], r["protocol"] = a.port, "udp" if a.udp else "tcp"
     elif a.udp:
@@ -1111,7 +1141,7 @@ RULES
                        Then, for a newer Homebrew version installed beside
                        the one the rules name (python@3.16, rules for 3.15
                        only), the allow go lines that carry them over
-  allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--udp] [--host] [--owner <USER>|anyone|system] [--via <PROGRAM>]
+  allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--udp] [--host|--address] [--owner <USER>|anyone|system] [--via <PROGRAM>]
   deny  [go] <PROCESS> <REMOTE> ...
                        shows the rule it would add; with go, adds it (one
                        already there is said, not doubled).
@@ -1124,7 +1154,9 @@ RULES
                                   Apple program is its code identity
                                   (com.apple.curl), as Little Snitch stores it
                          REMOTE   a domain (and its hosts), a host with
-                                  --host, or any
+                                  --host, addresses with --address (one,
+                                  a pattern 192.168.192.*, or a list
+                                  'a, b'), any, or local-net -- one per rule
                          --incoming  a connection TO PROCESS from REMOTE
                                   (a server: syncthing); without it, outgoing
                                   from PROCESS to REMOTE
@@ -1296,8 +1328,10 @@ _{SCRIPT_NAME.replace('-', '_')}() {{
     return
   fi
   case $words[2] in
-    allow|deny) _arguments '*:argument:(go any)' '--port[port]:port:' '--host[REMOTE is one host]' \\
-                  '--incoming[a connection to PROCESS]' \\
+    allow|deny) _arguments '*:argument:(go any local-net)' '--port[port]:port:' \\
+                  '(--address)--host[REMOTE is one host]' \\
+                  '(--host)--address[REMOTE is addresses: one, a pattern, a list]' \\
+                  '--incoming[a connection to PROCESS]' '--udp[a udp rule]' \\
                   '--owner[owner]:owner:(anyone system)' \\
                   '--via[the program it connects through]:program:_command_names' ;;
     remove|cleanup) _values argument go ;;
@@ -1635,6 +1669,68 @@ def t_allow_udp(t: T) -> None:
             f"list can print the allow line of a udp rule now: {allow_line(new, '/usr/bin/curl')}")
 
 
+def t_allow_address(t: T) -> None:
+    t.passed_roundtrip()
+    star = f"path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c"
+    imap = ["aria2c", "192.168.192.*", "--address", "--incoming", "--port", "993", "--owner", "system"]
+    rc, _, errs = t.run(["allow", "go", *imap])
+    new = t.rules()[-1]
+    t.check(rc == 0 and "added:" in errs and new.get("remote-addresses") == "192.168.192.*"
+            and "remote" not in new and "remote-domains" not in new and new.get("ports") == "993",
+            f"a pattern written as Little Snitch's own IMAP rules store one: {new} {errs}")
+    t.check("in allow  192.168.192.*  tcp/993  system" in errs, f"shown as list shows it: {errs}")
+    rc, _, errs = t.run(["allow", "go", *imap])
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 6, f"a second run changes nothing: {errs}")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "192.168.192.110,192.168.192.167", "--address"])
+    new = t.rules()[-1]
+    t.check(rc == 0 and new.get("remote-addresses") == "192.168.192.110, 192.168.192.167",
+            f"a list as Little Snitch writes one, 'a, b': {new} {errs}")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "192.168.192.110, 192.168.192.167", "--address"])
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 7, f"the same list, spaced: the same rule: {errs}")
+    alert: Rule = {"action": "allow", "direction": "incoming", "process": star, "remote-addresses": "10.1.1.*",
+             "ports": "143", "protocol": "tcp", "owner": "system", "origin": "alert", "useCount": 3,
+             "creationDate": "2024-04-04T16:34:31Z", "modificationDate": "2024-04-04T16:34:31Z"}
+    t.model(t.rules() + [alert])
+    rc, _, errs = t.run(["allow", "go", "aria2c", "10.1.1.*", "--address", "--incoming", "--port", "143",
+                         "--owner", "system"])
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 8,
+            f"the rule Little Snitch's alert wrote is found as the same: {errs}")
+    rc, out, _ = t.run(["list", "10.1.1"])
+    t.check(rc == 0 and out.strip().endswith("in allow  10.1.1.*  tcp/143  system"), f"and listed so: {out}")
+    line = allow_line(alert, "aria2c") or ""
+    t.check("'10.1.1.*' --address --incoming --port 143" in line, f"list can print its allow line: {line}")
+    listed = allow_line(t.rules()[6], "aria2c") or ""
+    rc, _, errs = t.run(shlex.split(listed)[1:])
+    t.check(rc == 0 and "already there" in errs, f"an address list's allow line names that rule: {listed} {errs}")
+
+
+def t_allow_local_net(t: T) -> None:
+    t.passed_roundtrip()
+    rc, _, errs = t.run(["allow", "go", "aria2c", "local-net", "--port", "any"])
+    new = t.rules()[-1]
+    t.check(rc == 0 and "added:" in errs and new.get("remote") == "local-net" and "remote-domains" not in new,
+            f"local-net is Little Snitch's remote itself, as 'any' is: {new} {errs}")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "local-net", "--port", "any"])
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 6, f"a second run changes nothing: {errs}")
+    rc, out, _ = t.run(["list", "local-net"])
+    t.check(rc == 0 and out.strip().endswith(f"allow  local-net  any  {t.user}"), f"listed as local-net: {out}")
+    line = allow_line(new, "aria2c") or ""
+    t.check(" aria2c local-net --port any" in line, f"list can print its allow line: {line}")
+
+
+def t_remote_one_kind(t: T) -> None:
+    t.passed_roundtrip()
+    for argv, want in ((["x.org", "--host", "--address"], "one remote per rule"),
+                       (["any", "--address"], "one remote per rule"),
+                       (["local-net", "--host"], "one remote per rule"),
+                       (["example.org", "--address"], "--address 'example.org': an address"),
+                       (["192.168.192.*"], "'192.168.192.*' is an address, not a domain -- add --address"),
+                       (["10.0.0.1", "--host"], "is an address, not a host")):
+        rc, _, errs = t.run(["allow", "go", "aria2c", *argv])
+        t.check(rc == 1 and want in errs and "ERROR 0005" in errs and len(t.rules()) == 5,
+                f"{argv}: refused, nothing added: {errs}")
+
+
 def t_list_lagging_versions(t: T) -> None:
     t.passed_roundtrip()
 
@@ -1653,7 +1749,7 @@ def t_list_lagging_versions(t: T) -> None:
               "protocol": "tcp", "uid": t.uid},
              {"action": "allow", "process": "path." + new[1:], "remote-domains": "keep.org", "ports": "443",
               "protocol": "tcp", "uid": t.uid},
-             {"action": "allow", "process": "path." + old[1:], "remote-addresses": "192.0.2.1", "ports": "53",
+             {"action": "allow", "process": "path." + old[1:], "remote-addresses": "192.0.2.1", "ports": "53, 5353",
               "protocol": "udp", "owner": "system"}])
     rc, out, errs = t.run(["list"])
     lines = [x for x in errs.splitlines() if x.startswith("   > ")]
@@ -1662,7 +1758,7 @@ def t_list_lagging_versions(t: T) -> None:
     want = f"   > my-little-snitch allow go {shlex.quote(new)} pypi.org --port 443 --owner {t.user}"
     t.check(lines[:1] == [want], f"the allow line for the newer Python, its Versions/ too: {lines}")
     t.check(len(lines) == 2 and "192.0.2.1" in lines[1] and "add it in Little Snitch" in lines[1]
-            and "allow go" not in lines[1], f"an address is not allow's: shown, never a wrong command: {lines}")
+            and "allow go" not in lines[1], f"a port list is not allow's: shown, never a wrong command: {lines}")
     t.check("keep.org" not in "".join(lines), "a rule the newer one already has is not suggested")
     t.check("3.14" not in errs, f"an older installed version is not suggested: {errs}")
     rc, _, errs = t.run(shlex.split(want[len("   > my-little-snitch "):]))
@@ -1849,7 +1945,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_address, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]
