@@ -103,10 +103,11 @@ exists: exactly the `cleanup?` lines of `list`.
 local time, in/out, program, remote, protocol/port, bytes in and out, new
 connects (when there were any), `DENIED n`. Each line is a sample of a
 connection: bytes with no connects is traffic on an open connection, 0 bytes
-is nothing moved. A PROCESS (`aria2c`, a path) matches every Homebrew version
-of it, as the connecting program or the app around it; anything else is a
-part of the line. `--denied`: only lines with a denial. `-V` adds the full
-path.
+is nothing moved. A PROCESS name (`aria2c`) matches every program of that
+name, whatever install it is (`/usr/local`'s and `/opt/homebrew`'s); a path
+matches that program, in every Homebrew version -- either as the connecting
+program or the app around it. Anything else is a part of the line.
+`--denied`: only lines with a denial. `-V` adds the full path.
 
 `--since` reaches as far back as Little Snitch keeps the log: on ada, 14
 months (back to 2025-08-13 on 2026-10-28, 3 million lines).

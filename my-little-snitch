@@ -37,7 +37,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Final, Generator, List, Literal, NoReturn, Optional, Sequence, Tuple, cast
+from typing import Callable, Dict, Final, Generator, List, Literal, NoReturn, Optional, Sequence, Set, Tuple, cast
 
 SCRIPT_NAME: Final = "my-little-snitch"
 SCRIPT_VERSION: Final = "1.0"
@@ -1028,12 +1028,20 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
         else:
             err("00043", "log [<PROCESS>|<FILTER>] [--since 1h] [--denied] -- one PROCESS or FILTER")
     start = since_of(since)
+    # A path is that one program, in all its Homebrew versions. A bare name is
+    # every program of that name -- the log holds other installs than the one
+    # on $PATH (ada: /usr/local's aria2c beside /opt/homebrew's) -- plus the
+    # name it connects as (python3: Python).
     pattern: Optional[str] = None
+    names: Set[str] = set()
     if what is not None and ("/" in what or shutil.which(what, path=":".join(
             os.environ.get("PATH", "").split(":") + list(s.program_path)))):
         prog = find_program(s, what)
-        pattern = prog.path
-        OUT.det(f" >>> {what} = {pattern}")
+        OUT.det(f" >>> {what} = {prog.path}")
+        if "/" in what:
+            pattern = prog.path
+        else:
+            names = {what, os.path.basename(prog.path)}
     cmd = [s.littlesnitch, "log-traffic", "-b", f"{start:%Y-%m-%d %H:%M:%S}"]
     OUT.det(f" >>> {shlex.join(cmd)}")
     phase("reading the traffic log")
@@ -1051,10 +1059,12 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
             parent = row.get("parentAppExecutable") or ""
             if pattern is not None and not (fnmatch.fnmatchcase(exe, pattern) or fnmatch.fnmatchcase(parent, pattern)):
                 continue
+            if names and not ({os.path.basename(exe), os.path.basename(parent)} & names):
+                continue
             if denied and not int(row.get("denyCount") or 0):
                 continue
             line = traffic_line(row, OUT.vrb)
-            if pattern is None and what is not None and what not in line:
+            if pattern is None and not names and what is not None and what not in line:
                 continue
             shown += 1
             OUT.result(line)
@@ -1067,7 +1077,8 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
                      "Little Snitch > Settings > Security > \"Allow access via Terminal\"")
     if rc != 0:
         err("00046", f"littlesnitch log-traffic failed [rc {rc}]: {said[:300]}")
-    which = f"{what} = {pattern}" if pattern else (f"lines holding '{what}'" if what else "everything")
+    which = (f"{what} = {pattern}" if pattern else f"programs named {' or '.join(sorted(names))}" if names
+             else f"lines holding '{what}'" if what else "everything")
     OUT.msg(f" >>> {shown} of {seen} line(s) since {start:%Y-%m-%d %H:%M}: {which}" + (", denied only" if denied else ""))
     return 0
 
@@ -1189,7 +1200,8 @@ TRAFFIC
                        in/out, program, remote, protocol/port, bytes in and
                        out, new connects (when any), DENIED -- bytes with no
                        connects is traffic on an open connection, 0 bytes is
-                       nothing moved. A PROCESS (aria2c, a path) matches all its
+                       nothing moved. A PROCESS name (aria2c) matches every
+                       program of that name, a path that program in all its
                        versions; anything else is a part of the line.
                        --since reaches as far back as Little Snitch keeps:
                        on ada, 14 months (2025-08-13 on 2026-10-28)
@@ -1869,6 +1881,27 @@ def t_log(t: T) -> None:
     t.check(str(t.cellar) in out, f"-V: the full path: {out}")
 
 
+def t_log_by_name(t: T) -> None:
+    # ada, 2026-10-31: `log aria2c` resolved to the Homebrew install on $PATH,
+    # and found 0 lines of another install's aria2c that the log had.
+    head = TRAFFIC.split("\n", 1)[0]
+    (t.dir / "traffic.csv").write_text(f"""{head}
+2026-10-22T00:41:07Z,out,501,1.2.3.4,files.example.org,6,443,3,0,100,200,"{t.cellar}/aria2/1.37.0/bin/aria2c",
+2026-10-22T00:41:09Z,out,501,1.2.3.5,dl3.example.org,6,443,1,1,0,0,"/usr/local/Cellar/aria2/1.36.0/bin/aria2c",
+2026-10-22T00:41:10Z,out,501,1.2.3.6,dl4.example.org,6,443,1,0,9,9,"/Applications/Helper.app/Contents/MacOS/aria2c",
+2026-10-22T00:41:11Z,out,501,1.2.3.7,dl5.example.org,6,443,1,1,9,9,"/Applications/Helper.app/Contents/MacOS/Helper","/usr/local/bin/aria2c"
+2026-10-22T00:41:12Z,out,501,1.2.3.8,other.example.org,6,443,1,1,9,9,"/usr/local/bin/aria2c-helper",
+""", encoding="utf-8")
+    _, out, _ = t.run(["log", "aria2c"])
+    t.check(len(out.splitlines()) == 4 and "other.example.org" not in out,
+            f"every program named aria2c, as connecting or parent, and no other: {out}")
+    _, out, _ = t.run(["log", "aria2c", "--denied"])
+    t.check(len(out.splitlines()) == 2 and "dl3.example.org" in out and "dl5.example.org" in out,
+            f"--denied: the denials of every aria2c: {out}")
+    _, out, _ = t.run(["log", str(t.cellar / "aria2" / "1.37.0" / "bin" / "aria2c")])
+    t.check(len(out.splitlines()) == 1 and "files.example.org" in out, f"a path: that program only: {out}")
+
+
 def t_refusals(t: T) -> None:
     global _geteuid
     _geteuid = lambda: 501
@@ -1946,7 +1979,7 @@ def t_version(t: T) -> None:
 
 TESTS: Final[List[Callable[[T], None]]] = [
     t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_address, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
-    t_verify_after_restore, t_remove_and_cleanup, t_log, t_refusals, t_lock, t_output_layers, t_create_config,
+    t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]
 
