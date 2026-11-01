@@ -19,7 +19,7 @@ my-little-snitch edits the exported model and restores it -- carefully, see
 ## Commands
 
     my-little-snitch list [<FILTER>]
-    my-little-snitch allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--udp] [--host|--address] [--owner <USER>|anyone|system] [--via <PROGRAM>]
+    my-little-snitch allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--udp|--icmp] [--host|--address] [--owner <USER>|anyone|system] [--via <PROGRAM>]
     my-little-snitch deny  [go] <PROCESS> <REMOTE> ...
     my-little-snitch remove [go] [<ID>..]
     my-little-snitch cleanup [go]
@@ -75,7 +75,8 @@ REMOTE is a domain (and its hosts), a host with `--host`, addresses with
 Little Snitch writes one) -- `any`, or `local-net`: one kind per rule, a mix
 is refused. `--port`
 defaults to 443 (tcp), `--owner` to `OWNER_DEFAULT`. `--udp` makes it a udp rule; it
-needs `--port` (dns is 53), since 443 is tcp's default. A rule that is already
+needs `--port` (dns is 53), since 443 is tcp's default. `--icmp` makes it an
+icmp rule (ping) and takes no `--port`. A rule that is already
 there is said, never doubled.
 
 `--incoming` turns it round: connections TO PROCESS from REMOTE -- a server.
