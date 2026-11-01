@@ -745,6 +745,7 @@ def cmd_list(s: Settings, args: Sequence[str]) -> int:
 
 REMOTE_WORDS: Final = ("any", "local-net")     # a REMOTE that is Little Snitch's `remote` itself
 RemoteKind = Literal["domains", "hosts", "addresses"]
+Protocol = Literal["tcp", "udp"]
 KIND_FLAGS: Final[Dict[str, RemoteKind]] = {"--host": "hosts", "--address": "addresses"}
 _ADDRESS: Final = re.compile(r"[0-9A-Fa-f:.*/-]*[.:][0-9A-Fa-f:.*/-]*")
 
@@ -777,7 +778,7 @@ class RuleArgs:
     kind: RemoteKind = "domains"
     port: Optional[str] = None
     incoming: bool = False
-    udp: bool = False
+    protocol: Protocol = "tcp"
     owner: Optional[str] = None
     via: Optional[str] = None
 
@@ -806,7 +807,7 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
         elif x == "--incoming":
             a.incoming = True
         elif x == "--udp":
-            a.udp = True
+            a.protocol = "udp"
         elif x.startswith("-"):
             err("00033", f"no such option for {verb}: '{x}' ({SCRIPT_NAME} --help)")
         else:
@@ -821,7 +822,7 @@ def parse_rule_args(verb: str, args: Sequence[str]) -> RuleArgs:
     if a.port is None:
         if a.incoming:      # 443 is where a client connects TO; what a program listens on, only the caller knows
             err("00035", f"{verb} --incoming: on which port does it listen? --port <N>|any")
-        if a.udp:           # 443 is tcp's default; a udp service (dns 53, ntp 123) has its own
+        if a.protocol == "udp":     # 443 is tcp's default; a udp service (dns 53, ntp 123) has its own
             err("00054", f"{verb} --udp: which port? --port <N>|any (dns is 53)")
         a.port = "443"
     return a
@@ -879,9 +880,9 @@ def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Opti
     else:
         r[f"remote-{a.kind}"] = a.remote
     if a.port != "any":
-        r["ports"], r["protocol"] = a.port, "udp" if a.udp else "tcp"
-    elif a.udp:
-        r["protocol"] = "udp"
+        r["ports"], r["protocol"] = a.port, a.protocol
+    elif a.protocol != "tcp":
+        r["protocol"] = a.protocol
     r.update(owner_fields)
     r.update({"origin": "frontend", "creationDate": now, "modificationDate": now})
     return r, prog, via, owner_shown
