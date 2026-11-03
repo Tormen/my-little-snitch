@@ -1055,7 +1055,7 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
         prog = find_program(s, what)
         OUT.det(f" >>> {what} = {prog.path}")
         if "/" in what:
-            pattern = prog.path.lower()
+            pattern = prog.path
         else:
             names = {what.lower(), os.path.basename(prog.path).lower()}
     cmd = [s.littlesnitch, "log-traffic", "-b", f"{start:%Y-%m-%d %H:%M:%S}"]
@@ -1073,7 +1073,8 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
             seen += 1
             exe = (row.get("connectingExecutable") or "").lower()
             parent = (row.get("parentAppExecutable") or "").lower()
-            if pattern is not None and not (fnmatch.fnmatchcase(exe, pattern) or fnmatch.fnmatchcase(parent, pattern)):
+            if pattern is not None and not (fnmatch.fnmatchcase(exe, pattern.lower())
+                                            or fnmatch.fnmatchcase(parent, pattern.lower())):
                 continue
             if names and not ({os.path.basename(exe), os.path.basename(parent)} & names):
                 continue
@@ -1938,8 +1939,9 @@ def t_log_by_name(t: T) -> None:
     _, out, _ = t.run(["log", "aria2c", "--denied"])
     t.check(len(out.splitlines()) == 2 and "dl3.example.org" in out and "dl5.example.org" in out,
             f"--denied: the denials of every aria2c: {out}")
-    _, out, _ = t.run(["log", str(t.cellar / "aria2" / "1.37.0" / "bin" / "aria2c")])
+    _, out, errs = t.run(["log", str(t.cellar / "aria2" / "1.37.0" / "bin" / "aria2c")])
     t.check(len(out.splitlines()) == 1 and "files.example.org" in out, f"a path: that program only: {out}")
+    t.check(f"= {t.cellar}/aria2/" in errs, f"the summary names the path as it is, not lower-cased: {errs}")
 
 
 def t_log_ignores_case(t: T) -> None:
