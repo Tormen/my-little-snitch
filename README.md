@@ -169,7 +169,9 @@ The change says how many first, and step 5 leaves them to Little Snitch.
 
 The traffic log is CSV: date (UTC), direction, uid, ipAddress,
 remoteHostname, protocol (6 tcp, 17 udp), port, connectCount, denyCount,
-byteCountIn, byteCountOut, connectingExecutable, parentAppExecutable.
+byteCountIn, byteCountOut, connectingExecutable, parentAppExecutable -- the
+programs as a rule names them (`path.opt/homebrew/Cellar/python@3.15/*/...`,
+version folder as `*`); `log` shows and matches them as paths.
 
 ## Config
 

@@ -1013,7 +1013,7 @@ def traffic_line(row: Dict[str, str], wide: bool) -> str:
     its bytes say whether anything moved; `connects` counts only the new
     connections in that sample, and is shown only when there were any."""
     when = datetime.datetime.strptime(row["date"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).astimezone()
-    exe = row.get("connectingExecutable", "")
+    exe = show_program(row.get("connectingExecutable", ""))
     prog = exe if wide else (os.path.basename(exe) or "?")
     remote = row.get("remoteHostname") or row.get("ipAddress", "?")
     n = int(row.get("connectCount") or 0)
@@ -1071,8 +1071,10 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
     if first.startswith("date,"):
         for row in csv.DictReader(p.stdout, fieldnames=next(csv.reader([first]))):
             seen += 1
-            exe = (row.get("connectingExecutable") or "").lower()
-            parent = (row.get("parentAppExecutable") or "").lower()
+            # log-traffic names a program as a rule does (path.opt/...), a path
+            # asked for is /opt/...: both are compared in the shown form.
+            exe = show_program(row.get("connectingExecutable") or "").lower()
+            parent = show_program(row.get("parentAppExecutable") or "").lower()
             if pattern is not None and not (fnmatch.fnmatchcase(exe, pattern.lower())
                                             or fnmatch.fnmatchcase(parent, pattern.lower())):
                 continue
@@ -1944,6 +1946,21 @@ def t_log_by_name(t: T) -> None:
     t.check(f"= {t.cellar}/aria2/" in errs, f"the summary names the path as it is, not lower-cased: {errs}")
 
 
+def t_log_rule_form(t: T) -> None:
+    # horse, 2026-11-03: log-traffic gave 13 rows as
+    # "path.opt/homebrew/Cellar/python@3.15/*/.../MacOS/Python", and `log
+    # /opt/homebrew/bin/python3` -- that very program -- matched none of them.
+    head = TRAFFIC.split("\n", 1)[0]
+    (t.dir / "traffic.csv").write_text(f"""{head}
+2026-10-22T00:41:07Z,out,501,1.2.3.4,files.example.org,6,443,1,0,9,9,"path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c",
+2026-10-22T00:41:08Z,out,501,1.2.3.5,other.example.org,6,443,1,0,9,9,"identifier.APPLE/com.apple.curl",
+""", encoding="utf-8")
+    _, out, _ = t.run(["log", str(t.cellar / "aria2" / "1.37.0" / "bin" / "aria2c")])
+    t.check(len(out.splitlines()) == 1 and "files.example.org" in out, f"a path matches its rule-form row: {out}")
+    _, out, _ = t.run(["-V", "log", "files.example"])
+    t.check(f" {t.cellar}/aria2/*/bin/aria2c " in out and "path." not in out, f"-V shows it as a path: {out}")
+
+
 def t_log_ignores_case(t: T) -> None:
     # horse, 2026-11-03: `log python --denied` said 0 lines, while every Python
     # connects as .../Python.app/Contents/MacOS/Python -- a zero that proved nothing.
@@ -2038,7 +2055,7 @@ def t_version(t: T) -> None:
 
 TESTS: Final[List[Callable[[T], None]]] = [
     t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
-    t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_ignores_case, t_refusals, t_lock, t_output_layers, t_create_config,
+    t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]
 
