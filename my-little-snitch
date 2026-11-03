@@ -338,9 +338,17 @@ SAME_FIELDS: Final = ("action", "process", "via", "direction", "remote", "remote
                       "remote-addresses", "ports", "protocol", "uid", "owner", "disabled")
 
 
+LIST_FIELDS: Final = ("remote-domains", "remote-hosts", "remote-addresses", "ports")
+
+
 def rule_meaning(r: Rule) -> str:
-    """What a rule decides -- two rules with the same meaning are one rule twice."""
-    return json.dumps({k: r.get(k) for k in SAME_FIELDS}, sort_keys=True)
+    """What a rule decides -- two rules with the same meaning are one rule twice.
+    A list ('a, b') is a set: Little Snitch stores an address list sorted."""
+    m = {k: r.get(k) for k in SAME_FIELDS}
+    for k in LIST_FIELDS:
+        if isinstance(m[k], str):
+            m[k] = ", ".join(sorted(x.strip() for x in str(m[k]).split(",")))
+    return json.dumps(m, sort_keys=True)
 
 
 def show_program(p: object) -> str:
@@ -1467,6 +1475,8 @@ if cmd == "restore-model":
         if r.get("uid") == 0:                  # ...and keeps root's rule as owner system (horse, 2026-10-28)
             del r["uid"]
             r["owner"] = "system"
+        if "," in r.get("remote-addresses", ""):   # ...and sorts an address list (macado, 2026-11-03)
+            r["remote-addresses"] = ", ".join(sorted(a.strip() for a in r["remote-addresses"].split(",")))
     json.dump(m, open(model, "w")); open(os.path.join(d, "restored"), "a").write("x\n"); sys.exit(0)
 if cmd == "log-traffic":
     sys.stdout.write(open(os.path.join(d, "traffic.csv")).read()); sys.exit(0)
@@ -1722,6 +1732,20 @@ def t_allow_icmp(t: T) -> None:
     # without its via: an Apple via is an identity, which --via cannot take
     line = allow_line({k: v for k, v in new.items() if k != "via"}, str(script)) or ""
     t.check("--icmp" in line and "--port" not in line, f"list can print its allow line, without a port: {line}")
+
+
+def t_allow_address_order(t: T) -> None:
+    t.passed_roundtrip()
+    arg = ["allow", "aria2c", "192.168.192.252, 172.17.17.17", "--address", "--port", "445", "--owner", "system"]
+    rc, _, errs = t.run(arg[:1] + ["go"] + arg[1:])
+    new = t.rules()[-1]
+    t.check(rc == 0 and "added:" in errs and new.get("remote-addresses") == "172.17.17.17, 192.168.192.252",
+            f"Little Snitch stores the list sorted, and that is the rule asked for: {new} {errs}")
+    rc, _, errs = t.run(arg)
+    t.check(rc == 0 and "already there" in errs, f"the list in the order asked: already there: {errs}")
+    rc, _, errs = t.run(["allow", "aria2c", "192.168.192.252, 172.17.17.18", "--address", "--port", "445",
+                         "--owner", "system"])
+    t.check(rc == 0 and "would add" in errs, f"another address is another rule: {errs}")
 
 
 def t_allow_address(t: T) -> None:
@@ -2054,7 +2078,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]

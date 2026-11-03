@@ -72,8 +72,8 @@ A new minor version (`python@3.16`) is another program: allow it again.
 
 REMOTE is a domain (and its hosts), a host with `--host`, addresses with
 `--address` -- one, a pattern (`192.168.192.*`) or a list (`a, b`, as
-Little Snitch writes one) -- `any`, or `local-net`: one kind per rule, a mix
-is refused. `--port`
+Little Snitch writes one; it stores the list sorted, so a list's order makes
+no other rule) -- `any`, or `local-net`: one kind per rule, a mix is refused. `--port`
 defaults to 443 (tcp), `--owner` to `OWNER_DEFAULT`. `--udp` makes it a udp rule; it
 needs `--port` (dns is 53), since 443 is tcp's default. `--icmp` makes it an
 icmp rule (ping) and takes no `--port`. A rule that is already
