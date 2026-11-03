@@ -1046,7 +1046,8 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
     # A path is that one program, in all its Homebrew versions. A bare name is
     # every program of that name -- the log holds other installs than the one
     # on $PATH (ada: /usr/local's aria2c beside /opt/homebrew's) -- plus the
-    # name it connects as (python3: Python).
+    # name it connects as (python3: Python). Every match ignores case, as the
+    # file system does: `log python` must find the Python.app that connects.
     pattern: Optional[str] = None
     names: Set[str] = set()
     if what is not None and ("/" in what or shutil.which(what, path=":".join(
@@ -1054,9 +1055,9 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
         prog = find_program(s, what)
         OUT.det(f" >>> {what} = {prog.path}")
         if "/" in what:
-            pattern = prog.path
+            pattern = prog.path.lower()
         else:
-            names = {what, os.path.basename(prog.path)}
+            names = {what.lower(), os.path.basename(prog.path).lower()}
     cmd = [s.littlesnitch, "log-traffic", "-b", f"{start:%Y-%m-%d %H:%M:%S}"]
     OUT.det(f" >>> {shlex.join(cmd)}")
     phase("reading the traffic log")
@@ -1070,8 +1071,8 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
     if first.startswith("date,"):
         for row in csv.DictReader(p.stdout, fieldnames=next(csv.reader([first]))):
             seen += 1
-            exe = row.get("connectingExecutable") or ""
-            parent = row.get("parentAppExecutable") or ""
+            exe = (row.get("connectingExecutable") or "").lower()
+            parent = (row.get("parentAppExecutable") or "").lower()
             if pattern is not None and not (fnmatch.fnmatchcase(exe, pattern) or fnmatch.fnmatchcase(parent, pattern)):
                 continue
             if names and not ({os.path.basename(exe), os.path.basename(parent)} & names):
@@ -1079,7 +1080,7 @@ def cmd_log(s: Settings, args: Sequence[str]) -> int:
             if denied and not int(row.get("denyCount") or 0):
                 continue
             line = traffic_line(row, OUT.vrb)
-            if pattern is None and not names and what is not None and what not in line:
+            if pattern is None and not names and what is not None and what.lower() not in line.lower():
                 continue
             shown += 1
             OUT.result(line)
@@ -1941,6 +1942,23 @@ def t_log_by_name(t: T) -> None:
     t.check(len(out.splitlines()) == 1 and "files.example.org" in out, f"a path: that program only: {out}")
 
 
+def t_log_ignores_case(t: T) -> None:
+    # horse, 2026-11-03: `log python --denied` said 0 lines, while every Python
+    # connects as .../Python.app/Contents/MacOS/Python -- a zero that proved nothing.
+    head = TRAFFIC.split("\n", 1)[0]
+    app = f"{t.cellar}/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python"
+    (t.dir / "traffic.csv").write_text(f"""{head}
+2026-10-22T00:41:07Z,out,501,1.2.3.4,pypi.org,6,443,1,1,0,0,"{app}",
+2026-10-22T00:41:08Z,out,501,1.2.3.5,other.example.org,6,443,1,0,9,9,"/usr/bin/curl",
+""", encoding="utf-8")
+    _, out, _ = t.run(["log", "python", "--denied"])
+    t.check(len(out.splitlines()) == 1 and "pypi.org" in out, f"a FILTER ignores case: {out}")
+    _, out, _ = t.run(["log", "PYPI.ORG"])
+    t.check(len(out.splitlines()) == 1 and "pypi.org" in out, f"so does a remote: {out}")
+    _, out, _ = t.run(["log", "CURL"])
+    t.check(len(out.splitlines()) == 1 and "other.example.org" in out, f"a name ignores case: {out}")
+
+
 def t_refusals(t: T) -> None:
     global _geteuid
     _geteuid = lambda: 501
@@ -2018,7 +2036,7 @@ def t_version(t: T) -> None:
 
 TESTS: Final[List[Callable[[T], None]]] = [
     t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
-    t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_refusals, t_lock, t_output_layers, t_create_config,
+    t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_ignores_case, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]
 
