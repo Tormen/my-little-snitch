@@ -60,7 +60,7 @@ Python is its `Python.app`, which is what connects -- so the rule survives
 upgrades:
 
     my-little-snitch allow /opt/homebrew/bin/python3 api.example.org
-     >>> process: path.opt/homebrew/Cellar/python@3.15/*/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python
+     >>> process: /opt/homebrew/Cellar/python@3.15/*/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python
         > (from /opt/homebrew/bin/python3 = ...: a Python connects as its Python.app; its version folder made '*', ...)
      >>> would add: ...  allow  api.example.org  tcp/443  alice
 

@@ -915,7 +915,7 @@ def cmd_add(s: Settings, action: str, args: Sequence[str]) -> int:
     r, prog, via, _ = new_rule(s, action, a)
     for label, p in (("process", prog), ("via", via)):
         if p is not None and p.process is not None:
-            OUT.msg(f" >>> {label}: {r[label]}")
+            OUT.msg(f" >>> {label}: {show_program(r[label])}")
             if p.note:
                 OUT.msg(f"    > {p.note}")
     rules = load_rules(s)
@@ -1607,7 +1607,7 @@ def t_allow_shows_then_go(t: T) -> None:
     t.passed_roundtrip()
     rc, _, errs = t.run(["allow", "aria2c", "example.org"])
     t.check(rc == 0 and "would add:" in errs and len(t.rules()) == 5, f"without go nothing changes: {errs}")
-    t.check(f"path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c" in errs, f"the Homebrew version made '*': {errs}")
+    t.check(f"process: {t.cellar}/aria2/*/bin/aria2c\n" in errs, f"the Homebrew version made '*': {errs}")
     t.check("its version folder made '*', as Little Snitch's alert writes it" in errs, "and it says so")
     rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
     new = t.rules()[-1]
@@ -1648,12 +1648,12 @@ def t_allow_incoming(t: T) -> None:
 
 def t_apple_is_its_identity(t: T) -> None:
     rc, _, errs = t.run(["allow", "/usr/bin/curl", "example.org"])
-    t.check(rc == 0 and "process: identifier.APPLE/com.apple.curl" in errs and "path.usr/bin/curl" not in errs,
+    t.check(rc == 0 and "process: APPLE/com.apple.curl\n" in errs and "process: /usr/bin/curl" not in errs,
             f"an Apple program is its code identity, as Little Snitch stores curl: {errs}")
     t.check("would add: APPLE/com.apple.curl  allow  example.org" in errs, f"and shown so: {errs}")
     rc, _, errs = t.run(["allow", "aria2c", "example.org"])
-    t.check(rc == 0 and f"process: path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c" in errs,
-            f"anything else keeps its path: {errs}")
+    t.check(rc == 0 and f"process: {t.cellar}/aria2/*/bin/aria2c\n" in errs,
+            f"anything else keeps its path, shown as list shows it -- pasteable, not the model's 'path.' key: {errs}")
 
 
 def t_allow_via(t: T) -> None:
@@ -1676,7 +1676,7 @@ def t_allow_via(t: T) -> None:
     t.check("connection it lets through: my-little-snitch log aria2c" in errs,
             f"the proof is the via program's log -- it is what connects: {errs}")
     rc, _, errs = t.run(["allow", str(script), "example.org", "--via", "/usr/bin/curl"])
-    t.check("via: identifier.APPLE/com.apple.curl" in errs,
+    t.check("via: APPLE/com.apple.curl\n" in errs and "identifier." not in errs,
             f"an Apple program as via is its code identity, as Little Snitch stores ping's: {errs}")
     rc, _, errs = t.run(["allow", str(script), "example.org", "--via"])
     t.check(rc == 1 and "--via needs a value" in errs, errs)
