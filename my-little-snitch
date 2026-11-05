@@ -1858,7 +1858,7 @@ def t_python_is_its_app(t: T) -> None:
     (fw / "bin" / "python3.15").chmod(0o755)
     (t.dir / "bin" / "python3").symlink_to(fw / "bin" / "python3.15")
     rc, _, errs = t.run(["allow", "python3", "example.org"])
-    want = f"path.{str(t.cellar)[1:]}/python@3.15/*/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python"
+    want = f"process: {t.cellar}/python@3.15/*/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python\n"
     t.check(rc == 0 and want in errs, f"Little Snitch's own form: only the version folder '*', as its Python.app: {errs}")
     for bad in (f"{t.cellar}/python@*/*/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python",
                 f"{t.cellar}/python@3.15/*/Frameworks/Python.framework/Versions/*/Resources/Python.app/Contents/MacOS/Python"):
