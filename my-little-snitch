@@ -585,6 +585,20 @@ def prepare_dir(s: Settings) -> None:
 
 
 ROUNDTRIP_OK: Final = "roundtrip.ok"
+SETTLING: Final = (*COUNTERS, "modificationDate", "approved")
+
+
+def moved_rules(before: List[Rule], again: List[Rule]) -> List[str]:
+    """What a restore of `before` would undo in `again`: a rule added,
+    removed or edited meanwhile. Not what Little Snitch settles by itself
+    after a restore -- the order, the fields in SETTLING, the temporary rules
+    (which the restore ends anyway) -- or a run of several changes trips over
+    its own previous one."""
+    def keys(rules: List[Rule]) -> List[str]:
+        return sorted(json.dumps({k: v for k, v in r.items() if k not in SETTLING}, sort_keys=True)
+                      for r in rules if not temporary(r))
+    was, now = keys(before), keys(again)
+    return [f"new {k}" for k in now if k not in was] + [f"gone {k}" for k in was if k not in now]
 
 
 def change_model(s: Settings, change: Callable[[List[Rule]], List[Rule]], expect: Callable[[List[Rule]], List[str]],
@@ -612,10 +626,10 @@ def change_model(s: Settings, change: Callable[[List[Rule]], List[Rule]], expect
             new.write_text(json.dumps(model), encoding="utf-8")
             os.chmod(new, 0o600)
             phase("exporting again, to see whether a rule moved meanwhile")
-            again = rules_of(export_model(s, check))
-            if [rule_key(r) for r in again] != [rule_key(r) for r in before]:
+            moved = moved_rules(before, rules_of(export_model(s, check)))
+            if moved:
                 err("00028", "a rule changed in Little Snitch while this run prepared its change -- "
-                             "nothing restored; run it again")
+                             "nothing restored; run it again: " + "; ".join(moved[:3]))
             phase("restoring the changed rules")
             littlesnitch(s, "restore-model", "-t", str(new))
             phase("exporting once more, to check the change")
@@ -1462,6 +1476,12 @@ if cmd == "export-model":
     m = json.load(open(model))
     if mode("drift") and k == 2:
         m["rules"].append({"action": "allow", "process": "path.drift"})
+    if mode("settle") and k == 2:              # a restore's own aftermath, between two exports
+        m["rules"].reverse()
+        for r in m["rules"]:
+            r.update({"modificationDate": "2026-11-05T23:29:00Z", "approved": True})
+            if r.pop("lifetime", None):
+                r.update({"action": "suggestion", "origin": "expiredTemporary"})
     for r in m["rules"]:
         r["useCount"] = r.get("useCount", 0) + k
     json.dump(m, open(args[0], "w")); sys.exit(0)
@@ -1885,6 +1905,18 @@ def t_refuse_if_changed(t: T) -> None:
     rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
     t.check(rc == 1 and "ERROR 00028" in errs and not (t.dir / "restored").exists(),
             f"a rule moved between the exports: nothing restored: {errs}")
+    t.check('"process": "path.drift"' in errs, f"and the error names the rule that moved: {errs}")
+
+
+def t_settling_is_no_change(t: T) -> None:
+    t.passed_roundtrip()
+    t.model(t.rules() + [{"action": "allow", "process": "path.usr/bin/x", "remote": "any",
+                          "lifetime": "untilLogout", "origin": "alert"}])
+    t.mode("settle")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
+    t.check(rc == 0 and "added:" in errs and (t.dir / "restored").exists(),
+            f"rules reordered, re-dated, approved, a temporary one expired between the exports -- "
+            f"Little Snitch's own, nothing a restore would lose (horse: ERROR 00028 twice, mid-run): {errs}")
 
 
 def t_temporary_rules_end(t: T) -> None:
@@ -2078,7 +2110,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_temporary_rules_end,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]

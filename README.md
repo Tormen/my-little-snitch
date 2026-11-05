@@ -125,8 +125,11 @@ months (back to 2025-08-13 on 2026-10-28, 3 million lines).
 
 1. exports the model -- the backup, `BACKUP_DIR/<local time>.json` (0600)
 2. changes a copy
-3. exports again; if any rule differs from step 1 (counters aside), it
-   refuses: Little Snitch changed a rule meanwhile, and restoring would lose it
+3. exports again; if a rule was added, removed or edited since step 1, it
+   refuses and names it: restoring would undo that. What Little Snitch
+   settles by itself after a restore -- the order, counters,
+   `modificationDate`, `approved`, the temporary rules -- is no change, so
+   several changes in a row do not trip over each other
 4. restores the copy (`-t`: Terminal access stays on)
 5. exports once more; the rules must be exactly what was asked -- otherwise
    an ERROR names the backup and the command to restore it
