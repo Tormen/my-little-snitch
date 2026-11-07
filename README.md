@@ -186,5 +186,5 @@ wins.
 ## Tests
 
 `my-little-snitch --run-tests [<FILTER>]` -- TAP, against a stub
-littlesnitch that keeps its model in a file; runs as any user, changes
-nothing real.
+littlesnitch that keeps its model in a file and a stand-in codesign that
+says what signed each program; runs as any user, changes nothing real.

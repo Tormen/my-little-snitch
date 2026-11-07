@@ -458,7 +458,14 @@ class Program:
     process: Optional[str]          # None: any process
     asked: str
     path: str
-    note: str
+    found: str = ""                 # a path as given, a bare name as found on $PATH and PROGRAM_PATH
+    notes: Tuple[str, ...] = ()     # what was done to it on the way, in that order
+
+    @property
+    def note(self) -> str:
+        """The notes as one line, naming what was asked -- "" when nothing was done."""
+        source = f"from {self.asked}" + (f" = {self.found}" if self.found not in ("", self.asked) else "")
+        return f"({source}: {'; '.join(self.notes)})" if self.notes else ""
 
 
 _VERSION_STAR: Final = re.compile(r"/Cellar/[^/*]+/\*/[^*]*$")
@@ -479,7 +486,7 @@ def find_program(s: Settings, asked: str) -> Program:
     Python is its Python.app, which is what connects. A path given with a
     '*' is taken only in that one place."""
     if asked == "any":
-        return Program(None, asked, "", "")
+        return Program(None, asked, "")
     if "*" in asked:
         if not asked.startswith("/"):
             err("00018", f"'{asked}': a pattern must be a full path")
@@ -488,7 +495,7 @@ def find_program(s: Settings, asked: str) -> Program:
                          f"(/Cellar/<formula>/*/...) -- anywhere else it never matches")
         if not glob.glob(asked):
             err("00020", f"'{asked}' matches no file")
-        return Program("path." + asked[1:], asked, asked, "")
+        return Program("path." + asked[1:], asked, asked)
     if "/" in asked:
         found = asked
     else:
@@ -509,8 +516,7 @@ def find_program(s: Settings, asked: str) -> Program:
     if m:
         real = f"{m.group('pre')}{m.group('formula')}{m.group('at') or ''}/*/{m.group('rest')}"
         notes.append("its version folder made '*', as Little Snitch's alert writes it, so upgrades keep the rule")
-    via = f"from {asked}" + (f" = {found}" if found != asked else "")
-    return Program("path." + real.lstrip("/"), asked, "/" + real.lstrip("/"), f"({via}: {'; '.join(notes)})" if notes else "")
+    return Program("path." + real.lstrip("/"), asked, "/" + real.lstrip("/"), found, tuple(notes))
 
 
 def find_owner(s: Settings, given: Optional[str]) -> Tuple[Rule, str]:
@@ -872,13 +878,16 @@ def is_script(path: str) -> bool:
         return False
 
 
+_codesign = "/usr/bin/codesign"     # a stand-in in --run-tests: what signed a program is the test's, not this machine's
+
+
 def apple_identity(p: Program) -> Optional[str]:
     """An Apple platform binary's code identity, as Little Snitch stores one
     -- `identifier.APPLE/com.apple.curl` for /usr/bin/curl, as process or as
     via -- and None for anything else."""
     files = glob.glob(p.path) if "*" in p.path else [p.path]
     try:
-        cs = subprocess.run(["/usr/bin/codesign", "-dv", files[0]], capture_output=True, text=True,
+        cs = subprocess.run([_codesign, "-dv", files[0]], capture_output=True, text=True,
                             stdin=subprocess.DEVNULL, timeout=10).stderr
     except (OSError, subprocess.TimeoutExpired):
         cs = ""
@@ -1456,8 +1465,9 @@ def main(argv: Sequence[str]) -> int:
 
 # --- --run-tests -----------------------------------------------------------
 # TAP: the plan first, then "ok K - name" / "not ok K - name" as each ends.
-# Little Snitch is a stub script keeping its model in a file; nothing real
-# is read or changed, and the tests run as any user.
+# Little Snitch is a stub script keeping its model in a file, codesign a
+# stand-in answering from a table; nothing real is changed, and the tests
+# run as any user.
 
 STUB: Final = r'''#!/usr/bin/env python3
 import json, os, sys, shutil
@@ -1513,9 +1523,48 @@ date,direction,uid,ipAddress,remoteHostname,protocol,port,connectCount,denyCount
 2026-10-22T00:42:10Z,out,501,1.2.3.7,stream.example.net,6,443,0,0,1536000,512,"/Applications/Player.app/Contents/MacOS/Player",
 """
 
+CODESIGN_STUB: Final = r'''#!/usr/bin/env python3
+import json, os, sys
+f = sys.argv[-1]
+said = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "codesign.json"))).get(f)
+if said is None:
+    sys.stderr.write(f + ": code object is not signed at all\n"); sys.exit(1)
+sys.stderr.write(said); sys.exit(0)
+'''
+
+Signing = Literal["platform", "adhoc"]
+# what `codesign -dv` writes on stderr, as macOS 26's does: an Apple platform
+# binary, an ad-hoc signed one (Homebrew's builds)
+SIGNED_AS: Final[Dict[Signing, str]] = {
+    "platform": """\
+Executable={path}
+Identifier={ident}
+Format=Mach-O universal (x86_64 arm64e)
+CodeDirectory v=20400 size=2151 flags=0x0(none) hashes=62+2 location=embedded
+Platform identifier=26
+Signature size=4442
+Signed Time=19. Apr 2026 at 02:02:52
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=1 size=64
+""",
+    "adhoc": """\
+Executable={path}
+Identifier={ident}
+Format=Mach-O thin (arm64)
+CodeDirectory v=20400 size=25544 flags=0x2(adhoc) hashes=792+2 location=embedded
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=0 size=12
+""",
+}
+
 
 class T:
-    """One test: its folder, a stub littlesnitch, what it found wrong."""
+    """One test: its folder, a stub littlesnitch, a stand-in codesign, what it found wrong."""
 
     def __init__(self, folder: Path) -> None:
         self.dir = folder
@@ -1523,6 +1572,10 @@ class T:
         self.stub = folder / "littlesnitch"
         self.stub.write_text(f"#!{sys.executable}\n" + STUB.split("\n", 1)[1], encoding="utf-8")
         self.stub.chmod(0o755)
+        self.codesign = folder / "codesign"
+        self.codesign.write_text(f"#!{sys.executable}\n" + CODESIGN_STUB.split("\n", 1)[1], encoding="utf-8")
+        self.codesign.chmod(0o755)
+        self.signatures: Dict[str, str] = {}
         self.cellar = folder / "Cellar"
         me = pwd.getpwuid(os.getuid())
         self.user, self.uid = me.pw_name, me.pw_uid
@@ -1530,6 +1583,9 @@ class T:
         prog.parent.mkdir(parents=True)
         prog.write_text("#!/bin/sh\n")
         prog.chmod(0o755)
+        self.signed(str(prog), "aria2c-55554944a1b2c3d4e5f60718293a4b5c6d7e8f90", "adhoc")
+        self.signed("/usr/bin/curl", "com.apple.curl", "platform")
+        self.signed("/sbin/ping", "com.apple.ping", "platform")
         (folder / "bin").mkdir()
         (folder / "bin" / "aria2c").symlink_to(prog)
         (folder / "traffic.csv").write_text(TRAFFIC.format(cellar=self.cellar), encoding="utf-8")
@@ -1545,6 +1601,12 @@ class T:
     def check(self, ok: bool, what: str) -> None:
         if not ok:
             self.bad.append(what)
+
+    def signed(self, path: str, ident: str, how: Signing) -> None:
+        """What the stand-in codesign answers for the file PATH -- a file it
+        does not know is not signed at all."""
+        self.signatures[path] = SIGNED_AS[how].format(path=path, ident=ident)
+        (self.dir / "codesign.json").write_text(json.dumps(self.signatures), encoding="utf-8")
 
     def model(self, rules: List[Rule]) -> None:
         (self.dir / "model.json").write_text(json.dumps({"rules": rules, "other": 1}), encoding="utf-8")
@@ -2117,7 +2179,7 @@ TESTS: Final[List[Callable[[T], None]]] = [
 
 
 def run_tests(name_filter: str) -> int:
-    global _geteuid, _completion_on
+    global _geteuid, _completion_on, _codesign
     defined = {n for n in globals() if re.fullmatch(r"t_[a-z0-9_]+", n)}
     listed = {f.__name__ for f in TESTS}
     if defined != listed:
@@ -2126,20 +2188,21 @@ def run_tests(name_filter: str) -> int:
     chosen = [f for f in TESTS if name_filter in f.__name__]
     print(f"1..{len(chosen)}", flush=True)
     bad, home = 0, Path.cwd()
-    real_euid = _geteuid
+    real_euid, real_codesign = _geteuid, _codesign
     for k, test in enumerate(chosen, 1):
         with tempfile.TemporaryDirectory(prefix=f"{SCRIPT_NAME}-tests.") as d:
             t = T(Path(d).resolve())
             os.chdir(t.dir)
             _geteuid = lambda: 0
             _completion_on = False
+            _codesign = str(t.codesign)
             try:
                 test(t)
             except Exception as e:   # a test that crashes fails, and the next one runs
                 t.bad.append(f"crashed: {type(e).__name__}: {e}")
                 t.bad.extend(traceback.format_exc().splitlines())
             finally:
-                _geteuid, _completion_on = real_euid, True
+                _geteuid, _completion_on, _codesign = real_euid, True, real_codesign
                 os.chdir(home)
                 OUT.__init__()
         print(f"{'not ok' if t.bad else 'ok'} {k} - {test.__name__}", flush=True)
