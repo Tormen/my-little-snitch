@@ -35,7 +35,7 @@ import sys
 import tempfile
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Dict, Final, Generator, List, Literal, NoReturn, Optional, Sequence, Set, Tuple, cast
 
@@ -881,10 +881,12 @@ def is_script(path: str) -> bool:
 _codesign = "/usr/bin/codesign"     # a stand-in in --run-tests: what signed a program is the test's, not this machine's
 
 
-def apple_identity(p: Program) -> Optional[str]:
-    """An Apple platform binary's code identity, as Little Snitch stores one
-    -- `identifier.APPLE/com.apple.curl` for /usr/bin/curl, as process or as
-    via -- and None for anything else."""
+def code_identity(p: Program) -> Optional[str]:
+    """A signed program's code identity, as Little Snitch stores one, as
+    process or as via: `identifier.APPLE/<Identifier>` for an Apple platform
+    binary (/usr/bin/curl: com.apple.curl), `identifier.<TEAM>/<Identifier>`
+    for one signed with a Developer ID, TEAM its TeamIdentifier -- and None
+    for an unsigned or ad-hoc signed one (Homebrew's builds): no team."""
     files = glob.glob(p.path) if "*" in p.path else [p.path]
     try:
         cs = subprocess.run([_codesign, "-dv", files[0]], capture_output=True, text=True,
@@ -892,22 +894,31 @@ def apple_identity(p: Program) -> Optional[str]:
     except (OSError, subprocess.TimeoutExpired):
         cs = ""
     ident = re.search(r"^Identifier=(\S+)$", cs, re.M)
-    if ident and re.search(r"^Platform identifier=", cs, re.M):
+    if ident is None:
+        return None
+    if re.search(r"^Platform identifier=", cs, re.M):
         return f"identifier.APPLE/{ident.group(1)}"
-    return None
+    team = re.search(r"^TeamIdentifier=([A-Z0-9]+)$", cs, re.M)     # never "not set": ad-hoc, or Apple's own
+    return f"identifier.{team.group(1)}/{ident.group(1)}" if team else None
 
 
-def stored_form(p: Program) -> str:
-    """A program as Little Snitch's alert stores it, as process or as via: its
-    Apple identity, else `path.<path>` (with Homebrew's '*'). Its older plain
-    `/path` is only read, never written."""
-    return apple_identity(p) or str(p.process)
+def stored_form(p: Program) -> Program:
+    """A program as Little Snitch's alert stores it, as process or as via: a
+    signed one by its code identity, so its upgrades keep the rule -- a
+    Homebrew cask's path names its version -- else by `path.<path>` (with
+    Homebrew's '*'). Its older plain `/path` is only read, never written."""
+    ident = code_identity(p)
+    if ident is None:
+        return p
+    return replace(p, process=ident, notes=(
+        *p.notes, "named by its code identity, as Little Snitch's alert writes a signed program, so upgrades keep the rule"))
 
 
 def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Optional[Program], str]:
-    """The rule as Little Snitch's alert writes it. With a via program (curl,
-    run by a script), a script PROCESS is named `script.<path>`, as Little
-    Snitch names the scripts it shows "via" something."""
+    """The rule as Little Snitch's alert writes it, and its programs as it
+    names them. With a via program (curl, run by a script), a script PROCESS
+    is named `script.<path>`, as Little Snitch names the scripts it shows
+    "via" something."""
     prog = find_program(s, a.process)
     via = find_program(s, a.via) if a.via else None
     owner_fields, owner_shown = find_owner(s, a.owner)
@@ -916,10 +927,14 @@ def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Opti
     if a.incoming:
         r["direction"] = "incoming"
     if prog.process is not None:
-        r["process"] = ("script." + prog.path if via and is_script(prog.path)
-                        else stored_form(prog))
+        if via and is_script(prog.path):
+            r["process"] = "script." + prog.path
+        else:
+            prog = stored_form(prog)
+            r["process"] = prog.process
     if via and via.process is not None:
-        r["via"] = stored_form(via)
+        via = stored_form(via)
+        r["via"] = via.process
     if a.remote in REMOTE_WORDS:
         r["remote"] = a.remote
     else:
@@ -1207,13 +1222,16 @@ RULES
                        shows the rule it would add; with go, adds it (one
                        already there is said, not doubled).
                          PROCESS  any, a path, or a name found on $PATH
-                                  (aria2c). A Homebrew program gets '*' for its
-                                  version folder -- Little Snitch's one
-                                  wildcard -- and a Python is its Python.app,
-                                  so upgrades keep the rule (a new python@3.16
-                                  is another program: allow it again). An
-                                  Apple program is its code identity
-                                  (com.apple.curl), as Little Snitch stores it
+                                  (aria2c). A signed program is its code
+                                  identity, as Little Snitch stores it:
+                                  APPLE/com.apple.curl, or TEAM/identifier
+                                  for a Developer ID one (a Homebrew cask).
+                                  Any other is its path: a Homebrew one gets
+                                  '*' for its version folder -- Little
+                                  Snitch's one wildcard -- and a Python is its
+                                  Python.app. So upgrades keep the rule (a new
+                                  python@3.16 is another program: allow it
+                                  again)
                          REMOTE   a domain (and its hosts), a host with
                                   --host, addresses with --address (one,
                                   a pattern 192.168.192.*, or a list
@@ -1532,9 +1550,10 @@ if said is None:
 sys.stderr.write(said); sys.exit(0)
 '''
 
-Signing = Literal["platform", "adhoc"]
+Signing = Literal["platform", "adhoc", "developer-id"]
 # what `codesign -dv` writes on stderr, as macOS 26's does: an Apple platform
-# binary, an ad-hoc signed one (Homebrew's builds)
+# binary, an ad-hoc signed one (Homebrew's builds), one signed with a
+# Developer ID (a Homebrew cask's)
 SIGNED_AS: Final[Dict[Signing, str]] = {
     "platform": """\
 Executable={path}
@@ -1559,6 +1578,19 @@ Info.plist=not bound
 TeamIdentifier=not set
 Sealed Resources=none
 Internal requirements count=0 size=12
+""",
+    "developer-id": """\
+Executable={path}
+Identifier={ident}
+Format=Mach-O thin (arm64)
+CodeDirectory v=20500 size=538693 flags=0x10000(runtime) hashes=16823+7 location=embedded
+Signature size=9047
+Timestamp=26. Oct 2026 at 19:40:35
+Info.plist=not bound
+TeamIdentifier={team}
+Runtime Version=26.5.0
+Sealed Resources=none
+Internal requirements count=1 size=188
 """,
 }
 
@@ -1602,10 +1634,10 @@ class T:
         if not ok:
             self.bad.append(what)
 
-    def signed(self, path: str, ident: str, how: Signing) -> None:
+    def signed(self, path: str, ident: str, how: Signing, team: str = "") -> None:
         """What the stand-in codesign answers for the file PATH -- a file it
         does not know is not signed at all."""
-        self.signatures[path] = SIGNED_AS[how].format(path=path, ident=ident)
+        self.signatures[path] = SIGNED_AS[how].format(path=path, ident=ident, team=team)
         (self.dir / "codesign.json").write_text(json.dumps(self.signatures), encoding="utf-8")
 
     def model(self, rules: List[Rule]) -> None:
@@ -1736,6 +1768,64 @@ def t_apple_is_its_identity(t: T) -> None:
     rc, _, errs = t.run(["allow", "aria2c", "example.org"])
     t.check(rc == 0 and f"process: {t.cellar}/aria2/*/bin/aria2c\n" in errs,
             f"anything else keeps its path, shown as list shows it -- pasteable, not the model's 'path.' key: {errs}")
+
+
+def t_signed_is_its_identity(t: T) -> None:
+    # A Homebrew cask's program sits in a folder named for its version
+    # (Caskroom/<cask>/<version>/): a rule naming that path stops matching at
+    # the next upgrade. Signed with a Developer ID, it is named by its
+    # signature instead, as Little Snitch's alert names it.
+    t.passed_roundtrip()
+    team, ident = "ABCDE12345", "org.example.tool"
+    shown = f"{team}/{ident}"
+
+    def install(version: str) -> Path:
+        prog = t.dir / "Caskroom" / "tool" / version / "tool"
+        prog.parent.mkdir(parents=True)
+        prog.write_text("x")
+        prog.chmod(0o755)
+        t.signed(str(prog), ident, "developer-id", team)
+        link = t.dir / "bin" / "tool"
+        if link.is_symlink():
+            link.unlink()
+        link.symlink_to(prog)
+        return prog
+
+    old = install("1.0")
+    rc, _, errs = t.run(["allow", "tool", "example.org"])
+    t.check(rc == 0 and f"process: {shown}\n" in errs and "Caskroom" not in errs,
+            f"named by its signature, not by the path that holds its version: {errs}")
+    t.check("named by its code identity" in errs, f"and it says why: {errs}")
+    t.check(f"would add: {shown}  allow  example.org  tcp/443  {t.user}" in errs, f"shown as list shows it: {errs}")
+    rc, _, errs = t.run(["allow", "go", "tool", "example.org"])
+    new = t.rules()[-1]
+    t.check(rc == 0 and "added:" in errs and new.get("process") == f"identifier.{shown}" and "via" not in new,
+            f"stored as Little Snitch stores it: {new} {errs}")
+    install("1.1")
+    shutil.rmtree(old.parent)
+    rc, _, errs = t.run(["allow", "go", "tool", "example.org"])
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 6,
+            f"the cask upgraded: the same rule, never a second one: {errs}")
+    rc, out, _ = t.run(["list", shown])
+    t.check(rc == 0 and out.strip().endswith(f"{shown}  allow  example.org  tcp/443  {t.user}"),
+            f"listed so, nothing to do: its old version folder is gone, but a signature names no file: {out}")
+    rc, out, _ = t.run(["cleanup"])
+    t.check(rc == 0 and shown not in out, f"so cleanup leaves it: {out}")
+    alert: Rule = {"action": "allow", "process": f"identifier.{shown}", "remote-domains": "example.com",
+                   "ports": "443", "protocol": "tcp", "uid": t.uid, "origin": "alert", "useCount": 12,
+                   "creationDate": "2026-10-08T18:30:00Z", "modificationDate": "2026-10-08T18:30:00Z"}
+    t.model(t.rules() + [alert])
+    rc, _, errs = t.run(["allow", "tool", "example.com"])
+    t.check(rc == 0 and f"already there: {rule_id(alert)}\t{shown}  allow  example.com" in errs,
+            f"the rule Little Snitch's alert wrote is found as the same: {errs}")
+    rc, _, errs = t.run(["allow", "go", "any", "example.net", "--via", "tool", "--owner", "anyone"])
+    new = t.rules()[-1]
+    t.check(rc == 0 and f"via: {shown}\n" in errs and "process" not in new and new.get("via") == f"identifier.{shown}",
+            f"as the program a process connects through, the same: {new} {errs}")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
+    new = t.rules()[-1]
+    t.check(rc == 0 and new.get("process") == f"path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c",
+            f"ad-hoc signed (TeamIdentifier=not set, as Homebrew's builds are): its path, never an identity: {new} {errs}")
 
 
 def t_allow_via(t: T) -> None:
@@ -2172,7 +2262,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_refusals, t_lock, t_output_layers, t_create_config,
     t_ctrl_c, t_version,
 ]

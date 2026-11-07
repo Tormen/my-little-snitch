@@ -52,17 +52,25 @@ The ID is a hash of the rule without Little Snitch's counters, so it stays
 the same from one `list` to the next; a changed rule gets a new one.
 
 **allow / deny** -- an outgoing rule, or with `--incoming` an incoming one. PROCESS is `any`, a path, or a name
-found on `$PATH` and `PROGRAM_PATH` (`aria2c`). An Apple program is its code
-identity (`identifier.APPLE/com.apple.curl`), as Little Snitch stores it. A
-Homebrew program gets `*`
+found on `$PATH` and `PROGRAM_PATH` (`aria2c`). A signed program is its code
+identity, as Little Snitch's alert writes it: an Apple one
+`identifier.APPLE/com.apple.curl`, one signed with a Developer ID
+`identifier.<TEAM>/<identifier>` -- a Homebrew cask's, whose path names its
+version, among them. Any other -- unsigned, or ad-hoc signed as Homebrew's own
+builds are -- is its path; a Homebrew program gets `*`
 for its version folder, as Little Snitch's own alert writes it -- and a
-Python is its `Python.app`, which is what connects -- so the rule survives
-upgrades:
+Python is its `Python.app`, which is what connects. Either way the rule
+survives upgrades:
 
     my-little-snitch allow /opt/homebrew/bin/python3 api.example.org
      >>> process: /opt/homebrew/Cellar/python@3.15/*/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python
         > (from /opt/homebrew/bin/python3 = ...: a Python connects as its Python.app; its version folder made '*', ...)
      >>> would add: ...  allow  api.example.org  tcp/443  alice
+
+    my-little-snitch allow /opt/homebrew/bin/tool api.example.org
+     >>> process: ABCDE12345/org.example.tool
+        > (from /opt/homebrew/bin/tool: named by its code identity, as Little Snitch's alert writes a signed program, ...)
+     >>> would add: ABCDE12345/org.example.tool  allow  api.example.org  tcp/443  alice
 
 Little Snitch has no wildcards in process paths but this one: a `*` for the
 folder of Homebrew's version, right after `Cellar/<formula>/` (its
@@ -86,8 +94,8 @@ It needs `--port`, since what a program listens on only the caller knows;
     my-little-snitch allow go syncthing any --incoming --port any --owner anyone
 
 `--via <PROGRAM>` is the program PROCESS connects through -- curl, run by a
-script or by brew -- found the same way as PROCESS and written as Little Snitch stores one (an
-Apple program by its code identity, `com.apple.curl`). A script PROCESS is then
+script or by brew -- found the same way as PROCESS and written as Little Snitch stores one (a
+signed program by its code identity, `APPLE/com.apple.curl`). A script PROCESS is then
 `script.<path>`, as Little Snitch names the scripts it shows "via" something.
 The rule's proof is the via program's log (`log curl`): it is what connects.
 
@@ -154,7 +162,8 @@ The change says how many first, and step 5 leaves them to Little Snitch.
 `rules` is a list of flat dicts:
 
 - `process`: `path.<path without the leading />` (with `*`),
-  `identifier.<TEAM>/<bundle id>`, `script.<path>`, an older plain
+  `identifier.<TEAM>/<identifier>` (a signed program; `APPLE` for Apple's
+  own), `script.<path>`, an older plain
   `/path`, or absent = any process; `via`, the program it runs through, in
   the same forms (`identifier.APPLE/com.apple.ping`,
   `path.usr/local/Cellar/pure-ftpd/*/sbin/pure-ftpd`; the plain `/path` is
