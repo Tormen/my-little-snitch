@@ -188,12 +188,29 @@ version folder as `*`); `log` shows and matches them as paths.
 ## Config
 
 `my-little-snitch --create-config` prints it: `LITTLESNITCH`, `BACKUP_DIR`
-(default `/var/db/my-little-snitch`), `OWNER_DEFAULT`,
-`PROGRAM_PATH`, `QUIET`/`VRB`/`DBG`. Searched as `--help` lists, first found
-wins.
+(default `$DATA_BASE_DIR/<user>/my-little-snitch`), `OWNER_DEFAULT`,
+`PROGRAM_PATH`, `QUIET`/`VRB`/`DBG`. Search order, first found wins:
+`$MY_LITTLE_SNITCH_CONFIG`, `--config <FILE>`,
+`$CONFIG_SEARCH_DIR/my-little-snitch.conf`, `$CONFIG_SEARCH_DIR/my-little-snitch`,
+`~/.my-little-snitch.conf`, `/etc/my-little-snitch.conf`,
+`/usr/local/etc/my-little-snitch.conf`.
+
+**A site file, read first.** `/LINKS/default/site.conf`, when it exists, is
+read before the config -- the one site path in my-little-snitch. Plain
+`KEY="value"` lines, for every tool of a site, parsed and never run:
+`DATA_BASE_DIR` (`BACKUP_DIR`'s default lies under it), `CONFIG_SEARCH_DIR`
+(searched as above), `CONFIG_OFFER_DIR` and `CONFIG_OFFER_NOTE` (where "no
+config found" offers to write one, and the note beside it -- only while
+`CONFIG_SEARCH_DIR` is searched, never that directory itself). Without the
+file: `/var/db`, no search directory, no site offer -- it works with no
+setup. There but unreadable: an error, never the fallback, which would keep
+this user's state apart from everyone else's. Environment variables are
+never read for these: a LaunchDaemon, `sudo` and a login shell would each
+see different ones.
 
 ## Tests
 
 `my-little-snitch --run-tests [<FILTER>]` -- TAP, against a stub
 littlesnitch that keeps its model in a file and a stand-in codesign that
-says what signed each program; runs as any user, changes nothing real.
+says what signed each program, and a site file of its own; runs as any
+user, changes nothing real.

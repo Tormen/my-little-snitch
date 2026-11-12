@@ -19,7 +19,6 @@ import contextlib
 import csv
 import datetime
 import fnmatch
-import getpass
 import glob
 import hashlib
 import io
@@ -106,14 +105,16 @@ def phase(text: str) -> None:
 DEFAULT_CONFIG: Final = '''\
 ## my-little-snitch.conf -- KEY="value" lines. my-little-snitch READS this
 ## file, it never runs it: no commands; $NAME and ${NAME} expand a key set
-## above, or the environment. Searched, first found wins (--help).
+## above, the site file's DATA_BASE_DIR, USER (the user it runs as), or the
+## environment. Searched, first found wins (--help).
 
 ## Little Snitch's command line tool
 LITTLESNITCH="/Applications/Little Snitch.app/Contents/Components/littlesnitch"
 
 ## where each change first saves the whole model (a JSON export), the lock,
-## and the record that 'diag roundtrip go' passed. Root only (0700).
-BACKUP_DIR="/var/db/my-little-snitch"
+## and the record that 'diag roundtrip go' passed: under DATA_BASE_DIR from
+## the site file (/var/db without it), the user, the tool. Root only (0700).
+BACKUP_DIR="$DATA_BASE_DIR/$USER/my-little-snitch"
 
 ## the owner of a new rule when --owner is not given: a user name (Little
 ## Snitch's "Me" of that user), "anyone" or "system". "": --owner is required.
@@ -143,19 +144,72 @@ class Settings:
     dbg: bool
 
 
-def config_search_paths() -> List[Path]:
-    """Where the config is looked for, in order (after $MY_LITTLE_SNITCH_CONFIG and --config)."""
-    site = Path(os.environ.get("LINKS", "/LINKS")) / "default"
-    return [site / f"{SCRIPT_NAME}.conf", site / SCRIPT_NAME, Path.home() / f".{SCRIPT_NAME}.conf",
-            Path("/etc") / f"{SCRIPT_NAME}.conf", Path("/usr/local/etc") / f"{SCRIPT_NAME}.conf"]
+_site_conf = Path("/LINKS/default/site.conf")    # the ONE site path in this tool: read_site (tests: their own)
 
 
-def config_offer() -> List[str]:
-    """Where to write a config, most common place first -- a FILTER of the
-    search list, so it never names a place that is not read."""
-    searched = config_search_paths()
-    return [str(p) for p in (Path("/etc") / f"{SCRIPT_NAME}.conf", Path.home() / f".{SCRIPT_NAME}.conf")
-            if p in searched]
+@dataclass(frozen=True)
+class Site:
+    """The site's values for every tool, from the site file; without it the
+    neutral ones: /var/db, no search directory, no offer."""
+
+    data_base_dir: str = "/var/db"
+    config_search_dir: str = ""
+    config_offer_dir: str = ""
+    config_offer_note: str = ""
+
+
+def read_site() -> Site:
+    """The site file, read before the config: plain KEY="value" lines, parsed
+    and never run, a $ in none of them. Not there: the neutral values. There
+    but unreadable: an error -- the neutral values would keep this user's
+    state apart from everyone else's. Never the environment: a LaunchDaemon,
+    sudo and a login shell would each see different values."""
+    if not _site_conf.exists():
+        return Site()
+    try:
+        text = _site_conf.read_text(encoding="utf-8")
+    except OSError as e:
+        err("00060", f"cannot read {_site_conf} ({e.strerror}) -- the site's directories for every tool")
+    for n, line in enumerate(text.splitlines(), 1):
+        if ("$" in line or "`" in line) and not line.strip().startswith("#"):
+            err("00061", f"{_site_conf}:{n}: a $ or ` -- the site file holds plain KEY=\"value\" lines, "
+                         f"read the same by every tool")
+    names: Dict[str, str] = {}
+    read_config_text(text, str(_site_conf), names)
+    return Site(data_base_dir=names.get("DATA_BASE_DIR") or Site.data_base_dir,
+                config_search_dir=names.get("CONFIG_SEARCH_DIR", ""),
+                config_offer_dir=names.get("CONFIG_OFFER_DIR", ""),
+                config_offer_note=names.get("CONFIG_OFFER_NOTE", ""))
+
+
+def config_search_paths(site: Site) -> List[Path]:
+    """Where the config is looked for, in order (after $MY_LITTLE_SNITCH_CONFIG
+    and --config): the site's search directory, both names, then ~, /etc."""
+    near = Path(site.config_search_dir)
+    return ([near / f"{SCRIPT_NAME}.conf", near / SCRIPT_NAME] if site.config_search_dir else []) + [
+        Path.home() / f".{SCRIPT_NAME}.conf", Path("/etc") / f"{SCRIPT_NAME}.conf",
+        Path("/usr/local/etc") / f"{SCRIPT_NAME}.conf"]
+
+
+def config_offer(site: Site) -> List[Tuple[Path, str]]:
+    """Where to write a config, most common place first, each with its note:
+    the site's offer directory -- only while the site's search directory is
+    searched, which a file there reaches as the note says, and never that
+    search directory itself, a farm -- then /etc and ~, each only when searched."""
+    offer: List[Tuple[Path, str]] = []
+    if site.config_offer_dir and site.config_search_dir and site.config_offer_dir != site.config_search_dir:
+        offer.append((Path(site.config_offer_dir) / f"{SCRIPT_NAME}.conf", site.config_offer_note))
+    searched = config_search_paths(site)
+    return offer + [(p, "") for p in (Path("/etc") / f"{SCRIPT_NAME}.conf", Path.home() / f".{SCRIPT_NAME}.conf")
+                    if p in searched]
+
+
+def no_config_offer(site: Site) -> str:
+    """'no config found': each offered place a paste-ready line, the site's note beside its own."""
+    lines = "\n".join(f"        > {SCRIPT_NAME} --create-config > {p}" + (f"   ({note})" if note else "")
+                      for p, note in config_offer(site))
+    return (f"no config found -- write one, most common place first:\n{lines}\n"
+            f"    ({SCRIPT_NAME} --help lists every place it is looked for)")
 
 
 _KEY_LINE: Final = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
@@ -172,8 +226,6 @@ def _expand(text: str, names: Dict[str, str], where: str) -> str:
             return names[name]
         if name in os.environ:
             return os.environ[name]
-        if name == "USER":
-            return getpass.getuser()
         if name == "HOME":
             return str(Path.home())
         err("00002", f"{where}: ${name} is not set (a key above, or the environment)")
@@ -248,7 +300,10 @@ def _flag(value: str, key: str, where: str) -> bool:
 def load_settings(override: Optional[str]) -> Settings:
     """The config: the defaults, then <FILE>.GLOBAL, then <FILE> on top."""
     phase("reading the config")
-    names: Dict[str, str] = {}
+    site = read_site()
+    # the site's base and the user it runs as -- never the environment's USER,
+    # which sudo -E or a LaunchDaemon may set to someone else
+    names: Dict[str, str] = {"DATA_BASE_DIR": site.data_base_dir, "USER": pwd.getpwuid(_geteuid()).pw_name}
     defaults = read_config_text(DEFAULT_CONFIG, "the built-in defaults", names)
     chosen = override or os.environ.get("MY_LITTLE_SNITCH_CONFIG")
     if chosen:
@@ -256,11 +311,9 @@ def load_settings(override: Optional[str]) -> Settings:
             err("00008", f"config '{chosen}' not found (--config / $MY_LITTLE_SNITCH_CONFIG)")
         found = Path(chosen)
     else:
-        hits = [p for p in config_search_paths() if p.is_file()]
+        hits = [p for p in config_search_paths(site) if p.is_file()]
         if not hits:
-            lines = "\n".join(f"        > {SCRIPT_NAME} --create-config > {p}" for p in config_offer())
-            err("00009", f"no config found -- write one, most common place first:\n{lines}\n"
-                         f"    ({SCRIPT_NAME} --help lists every place it is looked for)")
+            err("00009", no_config_offer(site))
         found = hits[0]
     files = [p for p in (found.with_name(found.name + ".GLOBAL"), found) if p.is_file()]
     for p in files:
@@ -1291,8 +1344,12 @@ OPTIONS
   -h, --help               this
 
 CONFIG  KEY="value" lines, read and never run -- the first found of
-  $MY_LITTLE_SNITCH_CONFIG, --config <FILE>,
-  {', '.join(str(p).replace(str(Path.home()), "~", 1) for p in config_search_paths())}
+  $MY_LITTLE_SNITCH_CONFIG, --config <FILE>, $CONFIG_SEARCH_DIR/{SCRIPT_NAME}.conf,
+  then $CONFIG_SEARCH_DIR/{SCRIPT_NAME}, ~/.{SCRIPT_NAME}.conf,
+  /etc/{SCRIPT_NAME}.conf, /usr/local/etc/{SCRIPT_NAME}.conf
+  {_site_conf}, when there, is read first: the site's
+  CONFIG_SEARCH_DIR, and DATA_BASE_DIR, under which BACKUP_DIR's default
+  lies (/var/db without the file). There but unreadable: an error.
 
 EXAMPLES
   {SCRIPT_NAME} allow /opt/homebrew/bin/python3 api.example.org
@@ -2239,6 +2296,74 @@ def t_create_config(t: T) -> None:
     t.check(rc == 1 and target.read_text() == DEFAULT_CONFIG, "an existing file is never written over")
 
 
+@contextlib.contextmanager
+def environ(**values: str) -> Generator[None, None, None]:
+    """os.environ with VALUES set, as it was afterwards."""
+    old = dict(os.environ)
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+
+
+def t_site_conf_gives_the_bases_the_search_and_the_offer(t: T) -> None:
+    """The site file's values when it is there, the neutral ones when it is not
+    -- an exported variable never in their place -- an error when it is there
+    but unreadable or holds a $; the search reads its directory first, the bare
+    name too; BACKUP_DIR's default lies under its DATA_BASE_DIR and the user it
+    runs as; the offer names its offer directory with the note, never the farm."""
+    farm, site_file, bare, root = t.dir / "farm", t.dir / "site.conf", t.dir / "bare", pwd.getpwuid(0).pw_name
+    bare.write_text(f'LITTLESNITCH="{t.stub}"\n')
+    with environ(DATA_BASE_DIR="/elsewhere", USER="someone-else", HOME=str(t.dir), MY_LITTLE_SNITCH_CONFIG=""):
+        t.check(read_site() == Site(), f"without the file: {read_site()}")
+        s = load_settings(str(bare))
+        t.check(s.backup_dir == Path(f"/var/db/{root}/{SCRIPT_NAME}"),
+                f"without the file, BACKUP_DIR's default: {s.backup_dir}")
+        farm.mkdir()
+        site_file.write_text(f'DATA_BASE_DIR="/srv/data"\nLOG_BASE_DIR="/srv/log"\nCONFIG_SEARCH_DIR="{farm}"\n'
+                             f'CONFIG_OFFER_DIR="{t.dir}/global"\nCONFIG_OFFER_NOTE="linked there by a run"\n')
+        (farm / SCRIPT_NAME).write_text('LITTLESNITCH="/x"\n')
+        s = load_settings(None)
+        t.check((s.files, s.littlesnitch, s.backup_dir) == ((farm / SCRIPT_NAME,), "/x",
+                                                            Path(f"/srv/data/{root}/{SCRIPT_NAME}")),
+                f"with the file: {s.files} {s.littlesnitch} {s.backup_dir}")
+        offer = no_config_offer(read_site())
+        t.check(f"> {SCRIPT_NAME} --create-config > {farm}/" not in offer, f"offered the farm: {offer}")
+        t.check(f"        > {SCRIPT_NAME} --create-config > {t.dir}/global/{SCRIPT_NAME}.conf   (linked there by a run)\n"
+                f"        > {SCRIPT_NAME} --create-config > /etc/{SCRIPT_NAME}.conf\n" in offer, f"offer: {offer}")
+    for text, code in (('DATA_BASE_DIR="$HOME/x"\n', "00061"), ('DATA_BASE_DIR="/x"\n', "00060")):
+        site_file.write_text(text)
+        if code == "00060":
+            site_file.chmod(0)
+        try:
+            read_site()
+            t.check(False, f"no error {code} for {text!r}")
+        except SnitchError as e:
+            t.check(e.code == code and str(site_file) in e.text, f"{code}: {e}")
+        site_file.chmod(0o600)
+
+
+def t_config_offer_names_only_searched_paths(t: T) -> None:
+    """Every offered path is searched, or is the site's offer directory while
+    the site's search directory is searched; that search directory, a farm,
+    is never offered -- not even when the offer directory is the same one."""
+    farm, glob_ = str(t.dir / "farm"), str(t.dir / "global")
+    for site in (Site(config_search_dir=farm, config_offer_dir=glob_), Site(config_offer_dir=glob_),
+                 Site(config_search_dir=farm, config_offer_dir=farm), Site()):
+        searched = config_search_paths(site)
+        for p, _ in config_offer(site):
+            if str(p).startswith(farm):
+                t.check(False, f"offered the farm: {p} ({site})")
+            elif str(p).startswith(glob_):
+                t.check(Path(farm) / f"{SCRIPT_NAME}.conf" in searched, f"offered {p}, its farm not searched ({site})")
+            else:
+                t.check(p in searched, f"offered but not searched: {p} ({site})")
+    t.check(config_offer(Site(config_search_dir=farm, config_offer_dir=glob_))[0][0]
+            == Path(glob_) / f"{SCRIPT_NAME}.conf", "the site's offer first")
+
+
 def t_ctrl_c(t: T) -> None:
     """A REAL SIGINT while remove waits for IDs on stdin: rc 130, one line."""
     env = dict(os.environ, MY_LITTLE_SNITCH_TEST_ROOT="1")
@@ -2264,12 +2389,13 @@ def t_version(t: T) -> None:
 TESTS: Final[List[Callable[[T], None]]] = [
     t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_refusals, t_lock, t_output_layers, t_create_config,
+    t_site_conf_gives_the_bases_the_search_and_the_offer, t_config_offer_names_only_searched_paths,
     t_ctrl_c, t_version,
 ]
 
 
 def run_tests(name_filter: str) -> int:
-    global _geteuid, _completion_on, _codesign
+    global _geteuid, _completion_on, _codesign, _site_conf
     defined = {n for n in globals() if re.fullmatch(r"t_[a-z0-9_]+", n)}
     listed = {f.__name__ for f in TESTS}
     if defined != listed:
@@ -2278,7 +2404,7 @@ def run_tests(name_filter: str) -> int:
     chosen = [f for f in TESTS if name_filter in f.__name__]
     print(f"1..{len(chosen)}", flush=True)
     bad, home = 0, Path.cwd()
-    real_euid, real_codesign = _geteuid, _codesign
+    real_euid, real_codesign, real_site = _geteuid, _codesign, _site_conf
     for k, test in enumerate(chosen, 1):
         with tempfile.TemporaryDirectory(prefix=f"{SCRIPT_NAME}-tests.") as d:
             t = T(Path(d).resolve())
@@ -2286,13 +2412,14 @@ def run_tests(name_filter: str) -> int:
             _geteuid = lambda: 0
             _completion_on = False
             _codesign = str(t.codesign)
+            _site_conf = t.dir / "site.conf"      # the test's own, not the machine's: none until a test writes it
             try:
                 test(t)
             except Exception as e:   # a test that crashes fails, and the next one runs
                 t.bad.append(f"crashed: {type(e).__name__}: {e}")
                 t.bad.extend(traceback.format_exc().splitlines())
             finally:
-                _geteuid, _completion_on, _codesign = real_euid, True, real_codesign
+                _geteuid, _completion_on, _codesign, _site_conf = real_euid, True, real_codesign, real_site
                 os.chdir(home)
                 OUT.__init__()
         print(f"{'not ok' if t.bad else 'ok'} {k} - {test.__name__}", flush=True)
@@ -2305,5 +2432,6 @@ def run_tests(name_filter: str) -> int:
 if __name__ == "__main__":
     if os.environ.get("MY_LITTLE_SNITCH_TEST_ROOT") == "1":     # t_ctrl_c's child: a test run, not root
         _geteuid = lambda: 0
+        _site_conf = Path.cwd() / "site.conf"                    # the test's folder, its cwd: not the machine's
     signal.signal(signal.SIGINT, signal.default_int_handler)
     sys.exit(main(sys.argv[1:]))
