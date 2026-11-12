@@ -158,18 +158,31 @@ class Site:
     config_offer_note: str = ""
 
 
+# python: the text, or None when plainly not there; anything else raises OSError
+def site_conf_text(path: str) -> str | None:
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except FileNotFoundError:
+        if os.path.lexists(path):
+            raise                                # a link to nothing
+        return None
+
+
 def read_site() -> Site:
     """The site file, read before the config: plain KEY="value" lines, parsed
     and never run, a $ in none of them. Not there: the neutral values. There
-    but unreadable: an error -- the neutral values would keep this user's
-    state apart from everyone else's. Never the environment: a LaunchDaemon,
-    sudo and a login shell would each see different values."""
-    if not _site_conf.exists():
-        return Site()
+    but unreadable -- or cannot tell: a link to nothing, a folder on the way
+    it cannot search, where "does it exist?" answers no -- an error: the
+    neutral values would keep this user's state apart from everyone else's.
+    Never the environment: a LaunchDaemon, sudo and a login shell would each
+    see different values."""
     try:
-        text = _site_conf.read_text(encoding="utf-8")
+        text = site_conf_text(str(_site_conf))
     except OSError as e:
         err("00060", f"cannot read {_site_conf} ({e.strerror}) -- the site's directories for every tool")
+    if text is None:
+        return Site()
     for n, line in enumerate(text.splitlines(), 1):
         if ("$" in line or "`" in line) and not line.strip().startswith("#"):
             err("00061", f"{_site_conf}:{n}: a $ or ` -- the site file holds plain KEY=\"value\" lines, "
@@ -2345,6 +2358,28 @@ def t_site_conf_gives_the_bases_the_search_and_the_offer(t: T) -> None:
         site_file.chmod(0o600)
 
 
+def t_site_conf_cannot_tell_is_an_error(t: T) -> None:
+    """The site file behind a folder it cannot search (this site's link into
+    the 750 global/etc/default, for an outsider) and a link to nothing are
+    errors, never the neutral values -- "does it exist?" answers no to both;
+    plainly not there is the neutral values."""
+    site_file, locked = t.dir / "site.conf", t.dir / "locked"
+    t.check(read_site() == Site(), f"not there: {read_site()}")
+    locked.mkdir()
+    (locked / "site.conf").write_text('DATA_BASE_DIR="/srv/data"\n')
+    locked.chmod(0)
+    try:
+        for target, what in ((locked / "site.conf", "behind a mode-000 folder"), (t.dir / "nowhere", "a link to nothing")):
+            site_file.unlink(missing_ok=True)
+            site_file.symlink_to(target)
+            try:
+                t.check(False, f"{what}: no error, {read_site()}")
+            except SnitchError as e:
+                t.check(e.code == "00060" and str(site_file) in e.text, f"{what}: {e.code} {e.text}")
+    finally:
+        locked.chmod(0o700)
+
+
 def t_config_offer_names_only_searched_paths(t: T) -> None:
     """Every offered path is searched, or is the site's offer directory while
     the site's search directory is searched; that search directory, a farm,
@@ -2389,7 +2424,7 @@ def t_version(t: T) -> None:
 TESTS: Final[List[Callable[[T], None]]] = [
     t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_refusals, t_lock, t_output_layers, t_create_config,
-    t_site_conf_gives_the_bases_the_search_and_the_offer, t_config_offer_names_only_searched_paths,
+    t_site_conf_gives_the_bases_the_search_and_the_offer, t_site_conf_cannot_tell_is_an_error, t_config_offer_names_only_searched_paths,
     t_ctrl_c, t_version,
 ]
 
