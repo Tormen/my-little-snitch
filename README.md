@@ -109,8 +109,9 @@ The rule's proof is the via program's log (`log curl`): it is what connects.
 exists: exactly the `cleanup?` lines of `list`.
 
 **log** -- the connections Little Snitch counted (`littlesnitch log-traffic`):
-local time, in/out, program, remote, protocol/port, bytes in and out, new
-connects (when there were any), `DENIED n`. Each line is a sample of a
+local time, in/out, program (and `(parent ...)`, when the log names the program
+it runs for), remote, protocol/port, bytes in and out, new connects (when
+there were any), `DENIED n`. Each line is a sample of a
 connection: bytes with no connects is traffic on an open connection, 0 bytes
 is nothing moved. A PROCESS name (`aria2c`) matches every program of that
 name, whatever install it is (`/usr/local`'s and `/opt/homebrew`'s); a path
@@ -118,7 +119,7 @@ matches that program, in every Homebrew version -- either as the connecting
 program or the app around it. Anything else is a part of the line. Every
 match ignores case, as macOS's file system does: `log python` finds the
 `Python` of a Python.app.
-`--denied`: only lines with a denial. `-V` adds the full path.
+`--denied`: only lines with a denial. `-V` adds the full path and the uid.
 
 `--since` reaches as far back as Little Snitch keeps the log: on ada, 14
 months (back to 2025-08-13 on 2026-10-28, 3 million lines).

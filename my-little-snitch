@@ -1123,17 +1123,23 @@ def human_bytes(text: str) -> str:
 def traffic_line(row: Dict[str, str], wide: bool) -> str:
     """One line per row of log-traffic. A row is a sample of a connection, so
     its bytes say whether anything moved; `connects` counts only the new
-    connections in that sample, and is shown only when there were any."""
+    connections in that sample, and is shown only when there were any. The
+    parent, when the log names one, is shown whole: it is what tells two
+    callers of the same program apart. -V adds the uid."""
     when = datetime.datetime.strptime(row["date"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).astimezone()
     exe = show_program(row.get("connectingExecutable", ""))
     prog = exe if wide else (os.path.basename(exe) or "?")
+    parent = show_program(row.get("parentAppExecutable") or "")
+    if parent:
+        prog += f" (parent {parent})"
     remote = row.get("remoteHostname") or row.get("ipAddress", "?")
     n = int(row.get("connectCount") or 0)
     denied = int(row.get("denyCount") or 0)
     return (f"{when:%Y-%m-%d %H:%M:%S}  {row.get('direction', '?'):<3}  {prog}  {remote}  "
             f"{PROTOCOLS.get(row.get('protocol', ''), row.get('protocol', '?'))}/{row.get('port', '?')}  "
             f"in {human_bytes(row.get('byteCountIn', '0'))} out {human_bytes(row.get('byteCountOut', '0'))}"
-            + (f"  {n} connect{'s' if n != 1 else ''}" if n else "") + (f"  DENIED {denied}" if denied else ""))
+            + (f"  {n} connect{'s' if n != 1 else ''}" if n else "") + (f"  DENIED {denied}" if denied else "")
+            + (f"  uid {row.get('uid', '?')}" if wide else ""))
 
 
 def cmd_log(s: Settings, args: Sequence[str]) -> int:
@@ -2256,6 +2262,28 @@ def t_log_ignores_case(t: T) -> None:
     t.check(len(out.splitlines()) == 1 and "other.example.org" in out, f"a name ignores case: {out}")
 
 
+def t_log_shows_parent(t: T) -> None:
+    # my-mail, 2026-11-13: its ada step's answer to "no answer" is `log Python
+    # --denied`, to see what Little Snitch calls a python3 started by
+    # my-rollout -> su -> dash -- a name the line never showed.
+    head = TRAFFIC.split("\n", 1)[0]
+    app = f"{t.cellar}/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python"
+    (t.dir / "traffic.csv").write_text(f"""{head}
+2026-10-22T00:41:07Z,out,501,1.2.3.4,imap.example.org,6,993,1,1,0,0,"{app}","script./usr/local/bin/getmail"
+2026-10-22T00:41:08Z,out,0,1.2.3.5,other.example.org,6,443,1,0,9,9,"/usr/bin/curl",
+""", encoding="utf-8")
+    _, out, _ = t.run(["log", "Python", "--denied"])
+    t.check("Python (parent script /usr/local/bin/getmail)  imap.example.org" in out,
+            f"the program, and the parent log-traffic names for it: {out}")
+    _, out, _ = t.run(["log", "getmail"])
+    t.check(len(out.splitlines()) == 1 and "imap.example.org" in out, f"a FILTER finds the parent too: {out}")
+    _, out, _ = t.run(["-V", "log", "other.example"])
+    t.check("/usr/bin/curl  other.example.org" in out and "parent" not in out and "uid 0" in out,
+            f"no parent, none shown; -V adds the uid: {out}")
+    _, out, _ = t.run(["log", "other.example"])
+    t.check("uid" not in out, f"the uid only with -V: {out}")
+
+
 def t_refusals(t: T) -> None:
     global _geteuid
     _geteuid = lambda: 501
@@ -2423,7 +2451,7 @@ def t_version(t: T) -> None:
 
 TESTS: Final[List[Callable[[T], None]]] = [
     t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
-    t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_refusals, t_lock, t_output_layers, t_create_config,
+    t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_log_shows_parent, t_refusals, t_lock, t_output_layers, t_create_config,
     t_site_conf_gives_the_bases_the_search_and_the_offer, t_site_conf_cannot_tell_is_an_error, t_config_offer_names_only_searched_paths,
     t_ctrl_c, t_version,
 ]
