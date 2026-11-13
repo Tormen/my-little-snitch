@@ -1731,6 +1731,15 @@ class T:
                      f'PROGRAM_PATH="{self.dir}/bin"\n' + extra, encoding="utf-8")
         return p
 
+    def python(self, v: str) -> str:
+        """A Homebrew python@<v> installed in the test's Cellar; its Python.app
+        as a rule names it, with '*' for the version folder."""
+        app = (self.cellar / f"python@{v}" / f"{v}.0" / "Frameworks" / "Python.framework" / "Versions" / v
+               / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python")
+        app.parent.mkdir(parents=True)
+        app.write_text("x")
+        return f"{self.cellar}/python@{v}/*/Frameworks/Python.framework/Versions/{v}/Resources/Python.app/Contents/MacOS/Python"
+
     def passed_roundtrip(self) -> None:
         (self.dir / "state").mkdir(exist_ok=True)
         (self.dir / "state" / ROUNDTRIP_OK).write_text("passed in the test\n", encoding="utf-8")
@@ -2060,16 +2069,8 @@ def t_remote_one_kind(t: T) -> None:
 
 def t_list_lagging_versions(t: T) -> None:
     t.passed_roundtrip()
-
-    def python(v: str) -> str:
-        app = (t.cellar / f"python@{v}" / f"{v}.0" / "Frameworks" / "Python.framework" / "Versions" / v
-               / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python")
-        app.parent.mkdir(parents=True)
-        app.write_text("x")
-        return f"{t.cellar}/python@{v}/*/Frameworks/Python.framework/Versions/{v}/Resources/Python.app/Contents/MacOS/Python"
-
-    old, new = python("3.15"), python("3.16")
-    python("3.14")     # an older one installed too
+    old, new = t.python("3.15"), t.python("3.16")
+    t.python("3.14")     # an older one installed too
     t.model([{"action": "allow", "process": "path." + old[1:], "remote-domains": "pypi.org", "ports": "443",
               "protocol": "tcp", "uid": t.uid},
              {"action": "allow", "process": "path." + old[1:], "remote-domains": "keep.org", "ports": "443",
