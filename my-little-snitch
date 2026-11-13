@@ -833,7 +833,8 @@ def cmd_list(s: Settings, args: Sequence[str]) -> int:
     todo = sum(1 for line in shown if "cleanup?[" in line)
     OUT.msg(f" >>> {len(shown)} of {len(rules)} rule(s)" + (f"; {todo} outdated -- '{SCRIPT_NAME} cleanup' shows them" if todo else ""))
     for (old, new), twins in lagging(rules, picked).items():
-        OUT.msg(f" >>> {new} is installed; {len(twins)} rule(s) only for {old} -- to carry them over:")
+        OUT.msg(f" >>> {new} is installed; {len(twins)} rule(s) only for {old} -- "
+                f"'{SCRIPT_NAME} upgrade' carries them all over; one by one:")
         for twin, path in twins:
             line = allow_line(twin, path)
             OUT.msg(f"   > {line}" if line else
@@ -1097,6 +1098,44 @@ def cmd_cleanup(s: Settings, args: Sequence[str]) -> int:
     return remove_rules(s, "cleanup", args == ["go"], lambda rules: [r for r in rules if verdict(r).startswith("cleanup?")])
 
 
+def cmd_upgrade(s: Settings, args: Sequence[str]) -> int:
+    """The rules a newer Homebrew version lacks (python@3.16 beside rules for
+    python@3.15 only) -- exactly what list's lag lines name -- each its old
+    version's rule with the new program, Little Snitch's counters left out.
+    Little Snitch takes a new minor version for another program, so after a
+    brew upgrade its connections would wait at alerts. Shows them; with go,
+    adds them. One rule lacked by two older versions is added once."""
+    if args not in ([], ["go"]):
+        err("00062", "upgrade [go] -- it takes nothing else")
+    rules = load_rules(s)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    add: List[Rule] = []
+    seen: Set[str] = set()
+    for (old, new), found in lagging(rules, rules).items():
+        OUT.msg(f" >>> {new} is installed; {len(found)} rule(s) only for {old}")
+        for twin, _ in found:
+            if rule_meaning(twin) in seen:
+                continue
+            seen.add(rule_meaning(twin))
+            r: Rule = {k: v for k, v in twin.items() if k not in COUNTERS}
+            r.update({"creationDate": stamp, "modificationDate": stamp})
+            add.append(r)
+            OUT.result(rule_line(r))
+    if not add:
+        OUT.msg(" >>> nothing to carry over: no newer Homebrew version lacks a rule")
+        return 0
+    say_temporaries(rules)
+    if args != ["go"]:
+        OUT.msg(f" >>> {len(add)} rule(s) would be added -- '{SCRIPT_NAME} upgrade go' adds them")
+        return 0
+    want = rules + add
+    backup = change_model(s, lambda current: current + add, expect_rules(want))
+    OUT.msg(f" >>> added {len(add)} rule(s)  [rules {len(rules)} -> {len(want)}]")
+    OUT.msg(f"    > stored and read back -- proven only by a connection each lets through: {SCRIPT_NAME} log <PROGRAM>")
+    OUT.det(f"    > the rules before: {backup}")
+    return 0
+
+
 _SINCE: Final = re.compile(r"(\d+)([mhd])$")
 
 
@@ -1288,7 +1327,8 @@ RULES
                        FILTER: a part of the line
                        Then, for a newer Homebrew version installed beside
                        the one the rules name (python@3.16, rules for 3.15
-                       only), the allow go lines that carry them over
+                       only), the allow go lines that carry them over --
+                       or upgrade, for all of them
   allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--udp|--icmp] [--host|--address] [--owner <USER>|anyone|system] [--via <PROGRAM>]
   deny  [go] <PROCESS> <REMOTE> ...
                        shows the rule it would add; with go, adds it (one
@@ -1302,8 +1342,8 @@ RULES
                                   '*' for its version folder -- Little
                                   Snitch's one wildcard -- and a Python is its
                                   Python.app. So upgrades keep the rule (a new
-                                  python@3.16 is another program: allow it
-                                  again)
+                                  python@3.16 is another program: upgrade
+                                  carries the rules over)
                          REMOTE   a domain (and its hosts), a host with
                                   --host, addresses with --address (one,
                                   a pattern 192.168.192.*, or a list
@@ -1325,6 +1365,11 @@ RULES
   cleanup [go]         the OUTDATED rules -- useless, since what they name
                        no longer exists: every 'cleanup?' line of list.
                        Shows them; with go, removes them
+  upgrade [go]         the rules a newer Homebrew version lacks: python@3.16
+                       installed beside rules for python@3.15 only -- Little
+                       Snitch takes a new minor version for another program.
+                       Shows them, each its old version's rule with the new
+                       program; with go, adds them. Run after brew upgrade
 
   A change exports the rules (the backup, in BACKUP_DIR), exports again and
   refuses if a rule moved meanwhile, restores, and checks the result. Not
@@ -1374,9 +1419,10 @@ EXAMPLES
   {SCRIPT_NAME} allow /opt/homebrew/bin/python3 api.example.org
   {SCRIPT_NAME} allow go syncthing any --incoming --port any --owner anyone
   {SCRIPT_NAME} log aria2c --since 1d --denied
-  {SCRIPT_NAME} cleanup go"""
+  {SCRIPT_NAME} cleanup go
+  {SCRIPT_NAME} upgrade go"""
 
-COMMANDS: Final = ("list", "allow", "deny", "remove", "cleanup", "log", "diag", "help")
+COMMANDS: Final = ("list", "allow", "deny", "remove", "cleanup", "upgrade", "log", "diag", "help")
 
 
 @dataclass
@@ -1466,6 +1512,8 @@ def run(argv: Sequence[str]) -> int:
         return cmd_remove(s, c.args)
     if c.command == "cleanup":
         return cmd_cleanup(s, c.args)
+    if c.command == "upgrade":
+        return cmd_upgrade(s, c.args)
     if c.command == "log":
         return cmd_log(s, c.args)
     return cmd_diag(s, c.args)
@@ -1477,6 +1525,7 @@ _{SCRIPT_NAME.replace('-', '_')}() {{
   local -a cmds
   cmds=(list:'one line per rule' allow:'add an allow rule' deny:'add a deny rule'
         remove:'remove rules by ID' cleanup:'remove the outdated rules'
+        upgrade:'the rules a newer Homebrew version lacks'
         log:'the traffic Little Snitch counted' diag:'roundtrip, events')
   if (( CURRENT == 2 )); then
     _describe command cmds
@@ -1491,7 +1540,7 @@ _{SCRIPT_NAME.replace('-', '_')}() {{
                   '--incoming[a connection to PROCESS]' '--udp[a udp rule]' '--icmp[an icmp rule: ping]' \\
                   '--owner[owner]:owner:(anyone system)' \\
                   '--via[the program it connects through]:program:_command_names' ;;
-    remove|cleanup) _values argument go ;;
+    remove|cleanup|upgrade) _values argument go ;;
     log) _arguments '1:program:_command_names' '--since[since]:time:(30m 1h 6h 1d 7d)' '--denied[denied only]' ;;
     diag) _values check roundtrip events ;;
   esac
@@ -2097,6 +2146,41 @@ def t_list_lagging_versions(t: T) -> None:
     t.check("is installed" not in errs, f"only the rules shown are looked at: {errs}")
 
 
+def t_upgrade_carries_rules(t: T) -> None:
+    t.passed_roundtrip()
+    v14, v15, v16 = t.python("3.14"), t.python("3.15"), t.python("3.16")
+
+    def rule(path: str, remote: str, **more: object) -> Rule:
+        return {"action": "allow", "process": "path." + path[1:], "remote-domains": remote, "ports": "443",
+                "protocol": "tcp", "uid": t.uid, **more}
+
+    t.model([rule(v14, "pypi.org"), rule(v15, "pypi.org", useCount=7, lastUsed="2026-11-01T10:00:00Z"),
+             rule(v15, "keep.org"), rule(v16, "keep.org"), rule(v15, "bad.org", action="deny"),
+             {"action": "allow", "process": "path." + v15[1:], "remote-addresses": "192.0.2.1", "ports": "53, 5353",
+              "protocol": "udp", "owner": "system"}])
+    before = len(t.rules())
+    rc, out, errs = t.run(["upgrade"])
+    shown = out.splitlines()
+    t.check(rc == 0 and len(shown) == 3 and all("python@3.16/*/" in x for x in shown),
+            f"3 rules shown, each for python@3.16: {out} {errs}")
+    t.check(len(t.rules()) == before and "upgrade go' adds them" in errs, f"without go nothing changes: {errs}")
+    rc, out, errs = t.run(["upgrade", "go"])
+    added = [r for r in t.rules() if "python@3.16" in str(r.get("process")) and r.get("remote-domains") != "keep.org"]
+    t.check(rc == 0 and len(t.rules()) == before + 3 and len(added) == 3,
+            f"pypi.org once, though two older versions lack it in 3.16: {len(t.rules())} {added} {errs}")
+    t.check(sorted(str(r.get("action")) for r in added) == ["allow", "allow", "deny"], f"a deny stays a deny: {added}")
+    t.check(all("useCount" not in r and "lastUsed" not in r for r in added), f"Little Snitch's counters stay behind: {added}")
+    t.check(any(r.get("ports") == "53, 5353" and r.get("owner") == "system" for r in added),
+            f"a rule allow cannot write is carried too: {added}")
+    rc, out, errs = t.run(["upgrade", "go"])
+    t.check(rc == 0 and out == "" and "nothing to carry over" in errs and len(t.rules()) == before + 3,
+            f"a second run finds nothing: {out} {errs}")
+    _, _, errs = t.run(["list"])
+    t.check("is installed" not in errs, f"list sees no lag after it: {errs}")
+    rc, _, errs = t.run(["upgrade", "now"])
+    t.check(rc == 1 and "ERROR 00062" in errs, f"upgrade takes nothing but go: {errs}")
+
+
 def t_python_is_its_app(t: T) -> None:
     fw = t.cellar / "python@3.15" / "3.15.0" / "Frameworks" / "Python.framework" / "Versions" / "3.15"
     (fw / "bin").mkdir(parents=True)
@@ -2451,7 +2535,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_upgrade_carries_rules, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_log_shows_parent, t_refusals, t_lock, t_output_layers, t_create_config,
     t_site_conf_gives_the_bases_the_search_and_the_offer, t_site_conf_cannot_tell_is_an_error, t_config_offer_names_only_searched_paths,
     t_ctrl_c, t_version,

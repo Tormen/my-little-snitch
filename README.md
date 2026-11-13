@@ -23,6 +23,7 @@ my-little-snitch edits the exported model and restores it -- carefully, see
     my-little-snitch deny  [go] <PROCESS> <REMOTE> ...
     my-little-snitch remove [go] [<ID>..]
     my-little-snitch cleanup [go]
+    my-little-snitch upgrade [go]
     my-little-snitch log [<PROCESS>|<FILTER>] [--since 1h] [--denied]
     my-little-snitch diag roundtrip [go] | diag events [--since 10m]
 
@@ -46,7 +47,8 @@ When a newer version of a versioned Homebrew formula is installed beside
 the one its rules name (`python@3.16`, rules for `python@3.15` only), `list`
 prints, under the rules shown, the `allow go` line for each rule the new one
 lacks. A rule `allow` cannot write (a list of domains or hosts, a port list,
-both ways) is shown instead, to add in Little Snitch.
+both ways) is shown instead, to add in Little Snitch -- or `upgrade` adds them
+all.
 
 The ID is a hash of the rule without Little Snitch's counters, so it stays
 the same from one `list` to the next; a changed rule gets a new one.
@@ -76,7 +78,8 @@ Little Snitch has no wildcards in process paths but this one: a `*` for the
 folder of Homebrew's version, right after `Cellar/<formula>/` (its
 developers, 2026-10). A `*` anywhere else -- `python@*`, `Versions/*` -- is
 stored by `restore-model` and never matches, so my-little-snitch refuses it.
-A new minor version (`python@3.16`) is another program: allow it again.
+A new minor version (`python@3.16`) is another program: `upgrade go` carries
+the rules over.
 
 REMOTE is a domain (and its hosts), a host with `--host`, addresses with
 `--address` -- one, a pattern (`192.168.192.*`) or a list (`a, b`, as
@@ -107,6 +110,18 @@ The rule's proof is the via program's log (`log curl`): it is what connects.
 
 **cleanup** -- the OUTDATED rules, useless because what they name no longer
 exists: exactly the `cleanup?` lines of `list`.
+
+**upgrade** -- the rules a newer Homebrew version lacks: exactly the rules
+`list` names under "is installed". Each is its old version's rule with the
+new program, Little Snitch's counters left out -- a deny stays a deny, and a
+rule `allow` cannot write is carried too; one that two older versions both
+lack is added once. Run it after `brew upgrade` (my-system-update does):
+
+    my-little-snitch upgrade go
+     >>> python@3.16 is installed; 2 rule(s) only for python@3.15
+    a41c07	/opt/homebrew/Cellar/python@3.16/*/.../Python  allow  pypi.org  tcp/443  alice
+    ...
+     >>> added 2 rule(s)  [rules 812 -> 814]
 
 **log** -- the connections Little Snitch counted (`littlesnitch log-traffic`):
 local time, in/out, program (and `(parent ...)`, when the log names the program
