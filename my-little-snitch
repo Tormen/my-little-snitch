@@ -767,9 +767,13 @@ def version_key(v: str) -> Tuple[int, ...]:
 
 
 def lagging(rules: List[Rule], shown: List[Rule]) -> Dict[Tuple[str, str], List[Tuple[Rule, str]]]:
-    """The shown rules of a versioned Homebrew formula (python@3.15) that a
-    NEWER installed one (python@3.16) has no twin of -- keyed by (old, new),
-    each with its twin and the twin's program path."""
+    """The shown rules of a versioned Homebrew formula that the NEWEST
+    version installed beside it (python@3.16) has no twin of -- only the
+    rules of the version just before it (python@3.15), in the same Cellar:
+    a rule left only on an older one (3.12) was not carried before either,
+    and carrying it now would widen what the new version may reach unasked
+    (ada, 2026-11-14: a 3.11 rule for any host offered to 3.12, 3.13 and
+    3.14). Keyed by (old, new), each with its twin and the twin's program path."""
     have = {rule_meaning(r) for r in rules}
     found: Dict[Tuple[str, str], List[Tuple[Rule, str]]] = {}
     for r in shown:
@@ -781,14 +785,14 @@ def lagging(rules: List[Rule], shown: List[Rule]) -> Dict[Tuple[str, str], List[
         if m is None or not m.group("at") or m.group("ver") != "*":
             continue
         formula, old = m.group("formula"), m.group("at")[1:]
-        for folder in sorted(glob.glob(f"{m.group('pre')}{formula}@*")):
-            new = folder.rsplit("@", 1)[1]
-            if version_key(new) <= version_key(old):
-                continue
-            path = f"{m.group('pre')}{formula}@{new}/*/{m.group('rest').replace(old, new)}"
-            twin = dict(r, process=("path." + path[1:] if prefix == "path." else "script." + path))
-            if glob.glob(path) and rule_meaning(twin) not in have:
-                found.setdefault((f"{formula}@{old}", f"{formula}@{new}"), []).append((twin, path))
+        installed = sorted((f.rsplit("@", 1)[1] for f in glob.glob(f"{m.group('pre')}{formula}@*")), key=version_key)
+        if len(installed) < 2 or installed[-2] != old:
+            continue
+        new = installed[-1]
+        path = f"{m.group('pre')}{formula}@{new}/*/{m.group('rest').replace(old, new)}"
+        twin = dict(r, process=("path." + path[1:] if prefix == "path." else "script." + path))
+        if glob.glob(path) and rule_meaning(twin) not in have:
+            found.setdefault((f"{formula}@{old}", f"{formula}@{new}"), []).append((twin, path))
     return found
 
 
@@ -1099,12 +1103,13 @@ def cmd_cleanup(s: Settings, args: Sequence[str]) -> int:
 
 
 def cmd_upgrade(s: Settings, args: Sequence[str]) -> int:
-    """The rules a newer Homebrew version lacks (python@3.16 beside rules for
-    python@3.15 only) -- exactly what list's lag lines name -- each its old
-    version's rule with the new program, Little Snitch's counters left out.
-    Little Snitch takes a new minor version for another program, so after a
-    brew upgrade its connections would wait at alerts. Shows them; with go,
-    adds them. One rule lacked by two older versions is added once."""
+    """The rules the newest Homebrew version of a formula lacks that the
+    version just before it has (python@3.16 beside rules for python@3.15
+    only) -- exactly what list's lag lines name (lagging) -- each the old
+    rule with the new program, Little Snitch's counters left out. Little
+    Snitch takes a new minor version for another program, so after a brew
+    upgrade its connections would wait at alerts. Shows them; with go, adds
+    them. A rule the old version holds twice is added once."""
     if args not in ([], ["go"]):
         err("00062", "upgrade [go] -- it takes nothing else")
     rules = load_rules(s)
@@ -1122,7 +1127,7 @@ def cmd_upgrade(s: Settings, args: Sequence[str]) -> int:
             add.append(r)
             OUT.result(rule_line(r))
     if not add:
-        OUT.msg(" >>> nothing to carry over: no newer Homebrew version lacks a rule")
+        OUT.msg(" >>> nothing to carry over: no newest Homebrew version lacks a rule of the one before it")
         return 0
     say_temporaries(rules)
     if args != ["go"]:
@@ -1325,10 +1330,10 @@ RULES
                          allow?[version-path]    works, but breaks on the next
                                                  upgrade: allow its program again
                        FILTER: a part of the line
-                       Then, for a newer Homebrew version installed beside
-                       the one the rules name (python@3.16, rules for 3.15
-                       only), the allow go lines that carry them over --
-                       or upgrade, for all of them
+                       Then, for the newest Homebrew version of a formula
+                       installed beside the one just before it (python@3.16,
+                       rules for 3.15 only), the allow go lines that carry
+                       them over -- or upgrade, for all of them
   allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--udp|--icmp] [--host|--address] [--owner <USER>|anyone|system] [--via <PROGRAM>]
   deny  [go] <PROCESS> <REMOTE> ...
                        shows the rule it would add; with go, adds it (one
@@ -1365,11 +1370,13 @@ RULES
   cleanup [go]         the OUTDATED rules -- useless, since what they name
                        no longer exists: every 'cleanup?' line of list.
                        Shows them; with go, removes them
-  upgrade [go]         the rules a newer Homebrew version lacks: python@3.16
-                       installed beside rules for python@3.15 only -- Little
-                       Snitch takes a new minor version for another program.
-                       Shows them, each its old version's rule with the new
-                       program; with go, adds them. Run after brew upgrade
+  upgrade [go]         the rules the newest Homebrew version of a formula
+                       lacks that the version just before it has: python@3.16
+                       beside rules for python@3.15 only -- Little Snitch
+                       takes a new minor version for another program. Older
+                       versions' rules are left. Shows them, each the old
+                       rule with the new program; with go, adds them. Run
+                       after brew upgrade
 
   A change exports the rules (the backup, in BACKUP_DIR), exports again and
   refuses if a rule moved meanwhile, restores, and checks the result. Not
@@ -2154,7 +2161,8 @@ def t_upgrade_carries_rules(t: T) -> None:
         return {"action": "allow", "process": "path." + path[1:], "remote-domains": remote, "ports": "443",
                 "protocol": "tcp", "uid": t.uid, **more}
 
-    t.model([rule(v14, "pypi.org"), rule(v15, "pypi.org", useCount=7, lastUsed="2026-11-01T10:00:00Z"),
+    t.model([rule(v14, "only14.org"), rule(v15, "pypi.org"),
+             rule(v15, "pypi.org", useCount=7, lastUsed="2026-11-01T10:00:00Z"),
              rule(v15, "keep.org"), rule(v16, "keep.org"), rule(v15, "bad.org", action="deny"),
              {"action": "allow", "process": "path." + v15[1:], "remote-addresses": "192.0.2.1", "ports": "53, 5353",
               "protocol": "udp", "owner": "system"}])
@@ -2167,7 +2175,9 @@ def t_upgrade_carries_rules(t: T) -> None:
     rc, out, errs = t.run(["upgrade", "go"])
     added = [r for r in t.rules() if "python@3.16" in str(r.get("process")) and r.get("remote-domains") != "keep.org"]
     t.check(rc == 0 and len(t.rules()) == before + 3 and len(added) == 3,
-            f"pypi.org once, though two older versions lack it in 3.16: {len(t.rules())} {added} {errs}")
+            f"pypi.org once, though 3.15 holds it twice: {len(t.rules())} {added} {errs}")
+    t.check(not any("only14.org" == r.get("remote-domains") for r in t.rules()[before:]),
+            f"3.14's rule, two versions back, is carried nowhere -- neither to 3.16 nor to 3.15: {t.rules()[before:]}")
     t.check(sorted(str(r.get("action")) for r in added) == ["allow", "allow", "deny"], f"a deny stays a deny: {added}")
     t.check(all("useCount" not in r and "lastUsed" not in r for r in added), f"Little Snitch's counters stay behind: {added}")
     t.check(any(r.get("ports") == "53, 5353" and r.get("owner") == "system" for r in added),

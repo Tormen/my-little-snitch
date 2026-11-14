@@ -43,10 +43,12 @@ token saying what:
 | `cleanup?[expired]` | an expired temporary rule (Little Snitch's "suggestion") |
 | `allow?[version-path]` | works, but names one Homebrew version: breaks on the next upgrade -- `allow go` its program again, then `remove go` this one |
 
-When a newer version of a versioned Homebrew formula is installed beside
-the one its rules name (`python@3.16`, rules for `python@3.15` only), `list`
-prints, under the rules shown, the `allow go` line for each rule the new one
-lacks. A rule `allow` cannot write (a list of domains or hosts, a port list,
+When the newest version of a versioned Homebrew formula is installed beside
+the one just before it (`python@3.16`, rules for `python@3.15` only), `list`
+prints, under the rules shown, the `allow go` line for each rule of the one
+before that the newest lacks. A rule left only on an older version
+(`python@3.12`) is not offered: it was not carried before either, and
+carrying it would widen what the new version may reach. A rule `allow` cannot write (a list of domains or hosts, a port list,
 both ways) is shown instead, to add in Little Snitch -- or `upgrade` adds them
 all.
 
@@ -111,11 +113,12 @@ The rule's proof is the via program's log (`log curl`): it is what connects.
 **cleanup** -- the OUTDATED rules, useless because what they name no longer
 exists: exactly the `cleanup?` lines of `list`.
 
-**upgrade** -- the rules a newer Homebrew version lacks: exactly the rules
-`list` names under "is installed". Each is its old version's rule with the
-new program, Little Snitch's counters left out -- a deny stays a deny, and a
-rule `allow` cannot write is carried too; one that two older versions both
-lack is added once. Run it after `brew upgrade` (my-system-update does):
+**upgrade** -- the rules the newest Homebrew version of a formula lacks that
+the version just before it has: exactly the rules `list` names under "is
+installed". Each is the old rule with the new program, Little Snitch's
+counters left out -- a deny stays a deny, a rule `allow` cannot write is
+carried too, and one the old version holds twice is added once. Older
+versions' rules are left as they are. Run it after `brew upgrade` (my-system-update does):
 
     my-little-snitch upgrade go
      >>> python@3.16 is installed; 2 rule(s) only for python@3.15
