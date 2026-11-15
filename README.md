@@ -107,6 +107,22 @@ The rule's proof is the via program's log (`log curl`): it is what connects.
 
     my-little-snitch allow go /usr/local/bin/fetch.sh example.org --via curl
 
+**An unsigned program also gets its rule for "any via" it.** A program
+Little Snitch names by its path -- unsigned, or ad-hoc signed as Homebrew's
+builds are -- is "Terminal via Python" when a terminal runs it (iTerm, Claude
+Code's `claude`, any app), and Little Snitch does not apply the program's own
+rule to that: it has no code signature. So `allow` and `deny` write, beside
+such a program's rule, the same rule for any process via the program, which
+Little Snitch does apply there (my-mail's terminal run on ada, 2026-11-15).
+It lets through nothing the program's own rule does not. A signed program,
+`any`, a script and a rule with `--via` get none. A rule already there
+without its twin gets the twin, so a tool's `--install` run again adds what
+an older version left out:
+
+    my-little-snitch allow go python3 imap.mailbox.org --port 993
+     >>> added: any via /opt/homebrew/Cellar/python@3.15/*/.../Python  allow  imap.mailbox.org  tcp/993  alice   (Python is not signed: run from a terminal, it is '<terminal> via Python' to Little Snitch, ...)
+     >>> added: /opt/homebrew/Cellar/python@3.15/*/.../Python  allow  imap.mailbox.org  tcp/993  alice  [rules 812 -> 814]
+
 **allow clears the denies that beat it.** Little Snitch decides between two
 rules that match a connection in this order (its help, "Rule precedence"),
 the first difference deciding: Priority set; the more specific server (an

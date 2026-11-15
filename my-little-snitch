@@ -1239,6 +1239,25 @@ def new_rule(s: Settings, action: str, a: RuleArgs) -> Tuple[Rule, Program, Opti
     return r, prog, via, owner_shown
 
 
+def terminal_twin(r: Rule, a: RuleArgs, path: str) -> Optional[Rule]:
+    """The same rule for any process via the program, for a program Little
+    Snitch names by its path -- unsigned or ad-hoc signed, as Homebrew's
+    builds are. Run from a terminal (or any other app), its connection is
+    '<app> via <program>', and Little Snitch does not apply the program's
+    own rule to it, the program having no code signature; this twin it
+    does apply (my-mail's terminal run on ada, 2026-11-15). It lets through
+    nothing the program's own rule does not: any script the program runs is
+    already admitted. None for a signed program, any process, a script (it
+    is run by its interpreter, not via it), or a rule with --via (its
+    caller named the parent)."""
+    process = str(r.get("process", ""))
+    if a.via or not process.startswith("path.") or is_script(path):
+        return None
+    twin: Rule = {k: v for k, v in r.items() if k != "process"}
+    twin["via"] = process
+    return twin
+
+
 def cmd_add(s: Settings, action: str, args: Sequence[str]) -> int:
     a = parse_rule_args(action, args)
     r, prog, via, _ = new_rule(s, action, a)
@@ -1247,7 +1266,13 @@ def cmd_add(s: Settings, action: str, args: Sequence[str]) -> int:
             OUT.msg(f" >>> {label}: {show_program(r[label])}")
             if p.note:
                 OUT.msg(f"    > {p.note}")
-    wanted: List[Tuple[Rule, str]] = [(r, "")]
+    wanted: List[Tuple[Rule, str]] = []
+    twin = terminal_twin(r, a, prog.path)
+    if twin is not None:
+        name = os.path.basename(prog.path)
+        wanted.append((twin, f"{name} is not signed: run from a terminal, it is '<terminal> via {name}' "
+                             f"to Little Snitch, which does not apply {name}'s own rule there"))
+    wanted.append((r, ""))      # last: the rule asked for is the newest in the model
     rules = load_rules(s)
     add: List[Tuple[Rule, str]] = []
     gone: Dict[str, Rule] = {}
@@ -1651,6 +1676,9 @@ RULES
                        would prefer over it: one with Priority, or the same
                        rule as a deny; a deny for a part of its remote (a
                        host, an address it resolves to) is left and said.
+                       An unsigned program (Homebrew's builds) also gets the
+                       same rule for 'any via' it: run from a terminal it is
+                       '<terminal> via <program>', which its own rule misses
                          PROCESS  any, a path, or a name found on $PATH
                                   (aria2c). A signed program is its code
                                   identity, as Little Snitch stores it:
@@ -2181,7 +2209,7 @@ def t_allow_shows_then_go(t: T) -> None:
     t.check("its version folder made '*', as Little Snitch's alert writes it" in errs, "and it says so")
     rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
     new = t.rules()[-1]
-    t.check(rc == 0 and "added:" in errs and len(t.rules()) == 6, f"go adds it: {errs}")
+    t.check(rc == 0 and "added:" in errs and len(t.rules()) == 7, f"go adds it: {errs}")
     t.check("proven only by a connection it lets through: my-little-snitch log aria2c" in errs,
             f"'added' does not claim the rule works: {errs}")
     t.check(new.get("remote-domains") == "example.org" and new.get("ports") == "443"
@@ -2189,7 +2217,7 @@ def t_allow_shows_then_go(t: T) -> None:
             f"the rule as the alert writes it: {new}")
     t.check(len(list((t.dir / "state").glob("*.json"))) == 1, "one backup per change")
     rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
-    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 6, f"never doubled: {errs}")
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 7, f"never doubled: {errs}")
     rc, _, errs = t.run(["deny", "go", "any", "evil.example", "--owner", "anyone", "--port", "any"])
     new = t.rules()[-1]
     t.check("connection it lets through: my-little-snitch log evil.example" in errs,
@@ -2239,17 +2267,17 @@ def t_allow_clears_beating_denies(t: T) -> None:
         t.check(rc == 0 and f"deny {ids[1]} is left" not in errs, f"the loser only with -V: {errs}")
         rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
         now = [rule_id(r) for r in t.rules()]
-        t.check(rc == 0 and ids[0] not in now and ids[4] not in now and len(t.rules()) == 8,
+        t.check(rc == 0 and ids[0] not in now and ids[4] not in now and len(t.rules()) == 9,
                 f"go removes the two and adds the allow, in one change: {len(t.rules())} {errs}")
         t.check(f"removing {ids[0]}: " in errs and "removed 2 deny" in errs
                 and len(list((t.dir / "state").glob("*.json"))) == 1, f"named, under one backup: {errs}")
         t.check(all(i in now for i in (ids[1], ids[2], ids[3], ids[5], ids[6], ids[7])), f"the rest stays: {errs}")
         rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
         t.check(rc == 0 and "already there" in errs and "removing" not in errs and "removed" not in errs
-                and len(t.rules()) == 8, f"a second run changes nothing: {errs}")
+                and len(t.rules()) == 9, f"a second run changes nothing: {errs}")
         t.model(t.rules() + [{"action": "deny", "remote-domains": "example.org", **mine}])
         rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
-        t.check(rc == 0 and "removed 1 deny" in errs and len(t.rules()) == 8,
+        t.check(rc == 0 and "removed 1 deny" in errs and len(t.rules()) == 9,
                 f"an allow already there loses a deny added later: {errs}")
         rc, _, errs = t.run(["deny", "go", "aria2c", "keep.org"])
         t.check(rc == 0 and any(r.get("remote-domains") == "keep.org" and r["action"] == "allow" for r in t.rules()),
@@ -2258,22 +2286,55 @@ def t_allow_clears_beating_denies(t: T) -> None:
         _resolve = old
 
 
+def t_unsigned_gets_terminal_twin(t: T) -> None:
+    """An unsigned program's rule comes with its twin for any process via
+    it -- what Little Snitch applies to '<terminal> via <program>' -- for a
+    deny as for an allow; the twin names no process, so it is no copy of the
+    program's rule. A signed program, any process and a rule with --via get
+    none. A rule already there without its twin gets the twin."""
+    t.passed_roundtrip()
+    aria = f"path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c"
+    rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
+    twin, main = t.rules()[-2], t.rules()[-1]
+    t.check(rc == 0 and len(t.rules()) == 7 and main.get("process") == aria, f"the program's rule: {main} {errs}")
+    t.check("process" not in twin and twin.get("via") == aria and twin.get("remote-domains") == "example.org"
+            and twin.get("ports") == "443" and twin.get("uid") == t.uid and twin["action"] == "allow",
+            f"its twin: any process via it, the rest the same: {twin}")
+    t.check("aria2c is not signed: run from a terminal" in errs and f"added: any via /{aria[5:]}  allow  example.org" in errs,
+            f"said: {errs}")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
+    t.check(rc == 0 and len(t.rules()) == 7 and errs.count("already there") == 2, f"a second run adds nothing: {errs}")
+    t.model([r for r in t.rules() if r is not twin and "via" not in r])
+    rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
+    t.check(rc == 0 and len(t.rules()) == 7 and "via" in t.rules()[-1],
+            f"the rule already there gets the twin it lacked: {errs}")
+    rc, _, errs = t.run(["deny", "go", "aria2c", "evil.example"])
+    t.check(rc == 0 and [r.get("action") for r in t.rules()[-2:]] == ["deny", "deny"]
+            and "process" not in t.rules()[-2], f"a deny is mirrored too: {errs}")
+    for argv in (["allow", "go", "/usr/bin/curl", "example.org"], ["allow", "go", "any", "example.net"],
+                 ["allow", "go", "any", "example.com", "--via", "aria2c"],
+                 ["allow", "go", "aria2c", "example.net", "--via", "/usr/bin/curl"]):
+        before = len(t.rules())
+        rc, _, errs = t.run(argv)
+        t.check(rc == 0 and len(t.rules()) == before + 1 and "is not signed" not in errs, f"no twin: {argv}: {errs}")
+
+
 def t_allow_incoming(t: T) -> None:
     t.passed_roundtrip()
     rc, _, errs = t.run(["allow", "go", "aria2c", "any", "--port", "any"])
-    t.check(rc == 0 and len(t.rules()) == 6 and "direction" not in t.rules()[-1], f"outgoing first: {errs}")
+    t.check(rc == 0 and len(t.rules()) == 7 and "direction" not in t.rules()[-1], f"outgoing first: {errs}")
     rc, _, errs = t.run(["allow", "aria2c", "any", "--incoming"])
     t.check(rc == 1 and "--port <N>|any" in errs, f"no port guessed for what a program listens on: {errs}")
     rc, _, errs = t.run(["allow", "go", "aria2c", "any", "--incoming", "--port", "any"])
     new = t.rules()[-1]
-    t.check(rc == 0 and "added:" in errs and len(t.rules()) == 7,
+    t.check(rc == 0 and "added:" in errs and len(t.rules()) == 9,
             f"the same rule incoming is another rule, not 'already there': {errs}")
     t.check(new.get("direction") == "incoming" and new.get("remote") == "any" and "ports" not in new
             and new.get("process") == f"path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c",
             f"incoming, any connection, the Homebrew '*' as for outgoing: {new}")
     t.check("in allow  any  any" in errs, f"shown as list shows it: {errs}")
     rc, _, errs = t.run(["allow", "go", "aria2c", "any", "--incoming", "--port", "any"])
-    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 7, f"never doubled: {errs}")
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 9, f"never doubled: {errs}")
 
 
 def t_apple_is_its_identity(t: T) -> None:
@@ -2447,26 +2508,26 @@ def t_allow_address(t: T) -> None:
             f"a pattern written as Little Snitch's own IMAP rules store one: {new} {errs}")
     t.check("in allow  192.168.192.*  tcp/993  system" in errs, f"shown as list shows it: {errs}")
     rc, _, errs = t.run(["allow", "go", *imap])
-    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 6, f"a second run changes nothing: {errs}")
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 7, f"a second run changes nothing: {errs}")
     rc, _, errs = t.run(["allow", "go", "aria2c", "192.168.192.110,192.168.192.167", "--address"])
     new = t.rules()[-1]
     t.check(rc == 0 and new.get("remote-addresses") == "192.168.192.110, 192.168.192.167",
             f"a list as Little Snitch writes one, 'a, b': {new} {errs}")
     rc, _, errs = t.run(["allow", "go", "aria2c", "192.168.192.110, 192.168.192.167", "--address"])
-    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 7, f"the same list, spaced: the same rule: {errs}")
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 9, f"the same list, spaced: the same rule: {errs}")
     alert: Rule = {"action": "allow", "direction": "incoming", "process": star, "remote-addresses": "10.1.1.*",
              "ports": "143", "protocol": "tcp", "owner": "system", "origin": "alert", "useCount": 3,
              "creationDate": "2024-04-04T16:34:31Z", "modificationDate": "2024-04-04T16:34:31Z"}
     t.model(t.rules() + [alert])
     rc, _, errs = t.run(["allow", "go", "aria2c", "10.1.1.*", "--address", "--incoming", "--port", "143",
                          "--owner", "system"])
-    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 8,
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 11,
             f"the rule Little Snitch's alert wrote is found as the same: {errs}")
     rc, out, _ = t.run(["list", "10.1.1"])
     t.check(rc == 0 and out.strip().endswith("in allow  10.1.1.*  tcp/143  system"), f"and listed so: {out}")
     line = allow_line(alert, "aria2c") or ""
     t.check("'10.1.1.*' --address --incoming --port 143" in line, f"list can print its allow line: {line}")
-    listed = allow_line(t.rules()[6], "aria2c") or ""
+    listed = allow_line(t.rules()[8], "aria2c") or ""
     rc, _, errs = t.run(shlex.split(listed)[1:])
     t.check(rc == 0 and "already there" in errs, f"an address list's allow line names that rule: {listed} {errs}")
 
@@ -2478,7 +2539,7 @@ def t_allow_local_net(t: T) -> None:
     t.check(rc == 0 and "added:" in errs and new.get("remote") == "local-net" and "remote-domains" not in new,
             f"local-net is Little Snitch's remote itself, as 'any' is: {new} {errs}")
     rc, _, errs = t.run(["allow", "go", "aria2c", "local-net", "--port", "any"])
-    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 6, f"a second run changes nothing: {errs}")
+    t.check(rc == 0 and "already there" in errs and len(t.rules()) == 7, f"a second run changes nothing: {errs}")
     rc, out, _ = t.run(["list", "local-net"])
     t.check(rc == 0 and out.strip().endswith(f"allow  local-net  any  {t.user}"), f"listed as local-net: {out}")
     line = allow_line(new, "aria2c") or ""
@@ -2594,7 +2655,7 @@ def t_roundtrip_gate(t: T) -> None:
     rc, _, errs = t.run(["diag", "roundtrip", "go"])
     t.check(rc == 0 and "roundtrip passed: 5 rules" in errs and (t.dir / "state" / ROUNDTRIP_OK).is_file(), errs)
     rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
-    t.check(rc == 0 and len(t.rules()) == 6, f"after it, changes go through: {errs}")
+    t.check(rc == 0 and len(t.rules()) == 7, f"after it, changes go through: {errs}")
 
 
 def t_refuse_if_changed(t: T) -> None:
@@ -2842,7 +2903,7 @@ def t_lock(t: T) -> None:
     p.wait()
     (lock / "owner").write_text(f"pid={p.pid} at=then\n")
     rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
-    t.check(rc == 0 and "breaking a stale lock" in errs and len(t.rules()) == 6 and not lock.exists(), errs)
+    t.check(rc == 0 and "breaking a stale lock" in errs and len(t.rules()) == 7 and not lock.exists(), errs)
 
 
 def t_output_layers(t: T) -> None:
@@ -2980,7 +3041,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_clears_beating_denies, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_upgrade_carries_rules, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_clears_beating_denies, t_unsigned_gets_terminal_twin, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_upgrade_carries_rules, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
     t_verify_after_restore, t_cleanup_asks_about_blocking, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_log_shows_parent, t_refusals, t_lock, t_output_layers, t_create_config,
     t_site_conf_gives_the_bases_the_search_and_the_offer, t_site_conf_cannot_tell_is_an_error, t_config_offer_names_only_searched_paths,
     t_ctrl_c, t_version,
