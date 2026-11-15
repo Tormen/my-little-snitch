@@ -502,12 +502,14 @@ def verdict(r: Rule) -> str:
     return ""
 
 
-def rule_line(r: Rule) -> str:
-    """ID, a TAB (so `cut -f 1` takes it), then the rule; the verdict last."""
+def rule_line(r: Rule, blocks: str = "") -> str:
+    """ID, a TAB (so `cut -f 1` takes it), then the rule; the verdict last --
+    `blocks?[<allow ID>]` for a deny that blocks part of that allow, when
+    there is nothing else to do about it."""
     action = str(r.get("action", "?")) + (" (off)" if r.get("disabled") else "")
     direction = {"incoming": "in ", "both": "both "}.get(str(r.get("direction")), "")
     cols = f"{show_process(r)}  {direction}{action}  {show_remote(r)}  {show_port(r)}  {show_owner(r)}"
-    v = verdict(r)
+    v = verdict(r) or (f"blocks?[{blocks}]" if blocks else "")
     return f"{rule_id(r)}\t{cols}" + (f"   {v}" if v else "")
 
 
@@ -924,6 +926,30 @@ def standoff(rules: List[Rule], allow: Rule) -> Standoff:
     return Standoff(tuple(beating), tuple(blocking), tuple(losing))
 
 
+@dataclass(frozen=True)
+class Block:
+    """A live deny that blocks part of an allow, and which part."""
+
+    deny: Rule
+    allow: Rule
+    part: str
+
+
+def blocks_of(rules: List[Rule], kept: Set[str]) -> Dict[str, Block]:
+    """By the deny's rule_key: each live deny that wins over a part of a live
+    allow's remote -- a host inside its domain, an address its host resolves
+    to -- unless its ID is kept (a block the user wants)."""
+    denies = [d for d in rules if d.get("action") == "deny" and not d.get("disabled")
+              and _remote(d)[0] != "any" and rule_id(d) not in kept]
+    found: Dict[str, Block] = {}
+    for a in rules:
+        if a.get("action") != "allow" or a.get("disabled") or not denies:
+            continue
+        for d, part, _ in standoff(denies, a).blocking:
+            found.setdefault(rule_key(d), Block(d, a, part))
+    return found
+
+
 # --- 5. commands -------------------------------------------------------------
 
 def load_rules(s: Settings) -> List[Rule]:
@@ -1001,12 +1027,31 @@ def allow_line(r: Rule, path: str) -> Optional[str]:
     return shlex.join(words)
 
 
+KEPT: Final = "kept"     # in BACKUP_DIR: the IDs of the blocking denies cleanup was told to keep
+
+
+def read_kept(s: Settings) -> Set[str]:
+    try:
+        return set((s.backup_dir / KEPT).read_text(encoding="utf-8").split())
+    except FileNotFoundError:
+        return set()
+
+
+def write_kept(s: Settings, ids: Set[str]) -> None:
+    """One ID per line, through a temp file and a rename."""
+    tmp = s.backup_dir / f".{KEPT}.{os.getpid()}"
+    tmp.write_text("".join(f"{i}\n" for i in sorted(ids)), encoding="utf-8")
+    os.replace(tmp, s.backup_dir / KEPT)
+
+
 def cmd_list(s: Settings, args: Sequence[str]) -> int:
     if len(args) > 1:
         err("00030", "list takes one <FILTER> at most")
     rules = load_rules(s)
-    picked = [r for r in rules if not args or args[0] in rule_line(r)]
-    shown = [rule_line(r) for r in picked]
+    blocks = {k: rule_id(b.allow) for k, b in blocks_of(rules, read_kept(s)).items()}
+    lines = [rule_line(r, blocks.get(rule_key(r), "")) for r in rules]
+    picked = [r for r, line in zip(rules, lines) if not args or args[0] in line]
+    shown = [line for line in lines if not args or args[0] in line]
     for line in shown:
         OUT.result(line)
     todo = sum(1 for line in shown if "cleanup?[" in line)
@@ -1298,10 +1343,70 @@ def cmd_remove(s: Settings, args: Sequence[str]) -> int:
     return remove_rules(s, "remove", go, pick)
 
 
+def _attended_tty() -> bool:
+    return sys.stdin.isatty() and sys.stderr.isatty()
+
+
+def _ask_tty(prompt: str) -> str:
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    return sys.stdin.readline().strip().lower()
+
+
+_attended: Callable[[], bool] = _attended_tty     # stand-ins in --run-tests: a test has no terminal
+_ask: Callable[[str], str] = _ask_tty
+
+
 def cmd_cleanup(s: Settings, args: Sequence[str]) -> int:
+    """The outdated rules (list's cleanup?), removed with go; then the denies
+    that block part of an allow (list's blocks?), each asked about at a
+    terminal -- remove, keep (recorded in KEPT, asked no more), skip. Without
+    a terminal or without go they are shown and left."""
     if args not in ([], ["go"]):
         err("00039", "cleanup [go] -- it takes nothing else")
-    return remove_rules(s, "cleanup", args == ["go"], lambda rules: [r for r in rules if verdict(r).startswith("cleanup?")])
+    go = args == ["go"]
+    rules = load_rules(s)
+    outdated = [r for r in rules if verdict(r).startswith("cleanup?")]
+    kept = read_kept(s)
+    blocks = [b for b in blocks_of(rules, kept).values() if not verdict(b.deny)]
+    for r in outdated:
+        OUT.result(rule_line(r))
+    if not outdated:
+        OUT.msg(" >>> nothing outdated")
+    if blocks:
+        OUT.msg(f" >>> {len(blocks)} deny(s) block part of an allow:")
+    for b in blocks:
+        OUT.msg(f"   > {rule_line(b.deny, rule_id(b.allow)).replace(chr(9), '  ')}")
+        OUT.msg(f"    > {rule_id(b.allow)} allows {show_remote(b.allow)} for {show_process(b.allow)}; "
+                f"this deny keeps {b.part} blocked")
+    if not outdated and not blocks:
+        return 0
+    say_temporaries(rules)
+    if not go:
+        OUT.msg(f"    > '{SCRIPT_NAME} cleanup go' removes the {len(outdated)} outdated"
+                + (", and asks at a terminal about each deny" if blocks else ""))
+        return 0
+    gone = {rule_key(r) for r in outdated}
+    if blocks and not _attended():
+        OUT.msg("    > not asked: no terminal -- the denies are left as they are")
+    elif blocks:
+        for b in blocks:
+            OUT.msg(f" >>> {rule_id(b.deny)}  {rule_cols(b.deny)}")
+            answer = _ask(f"    > it keeps {b.part} blocked, which allow {rule_id(b.allow)} would let through -- "
+                          f"[r]emove it  [k]eep it (asked no more)  [s]kip (ask next time)? ")
+            if answer == "r":
+                gone.add(rule_key(b.deny))
+            elif answer == "k":
+                kept.add(rule_id(b.deny))
+                write_kept(s, kept)
+                OUT.msg(f"    > kept: in {s.backup_dir / KEPT}, not asked again")
+    if not gone:
+        return 0
+    keep = [r for r in rules if rule_key(r) not in gone]
+    backup = change_model(s, lambda now: [r for r in now if rule_key(r) not in gone], expect_rules(keep))
+    OUT.msg(f" >>> removed {len(gone)} rule(s)  [rules {len(rules)} -> {len(keep)}]")
+    OUT.det(f"    > the rules before: {backup}")
+    return 0
 
 
 def cmd_upgrade(s: Settings, args: Sequence[str]) -> int:
@@ -1531,6 +1636,8 @@ RULES
                          cleanup?[expired]       an expired temporary rule
                          allow?[version-path]    works, but breaks on the next
                                                  upgrade: allow its program again
+                         blocks?[<ID>]           a deny for a part of allow <ID>'s
+                                                 remote (a host, an address)
                        FILTER: a part of the line
                        Then, for the newest Homebrew version of a formula
                        installed beside the one just before it (python@3.16,
@@ -1575,7 +1682,9 @@ RULES
                          {SCRIPT_NAME} list python@3.10 | cut -f 1 | {SCRIPT_NAME} remove go
   cleanup [go]         the OUTDATED rules -- useless, since what they name
                        no longer exists: every 'cleanup?' line of list.
-                       Shows them; with go, removes them
+                       Shows them; with go, removes them. Then each
+                       'blocks?' deny: with go at a terminal, asks whether
+                       to remove it, keep it (asked no more) or skip it
   upgrade [go]         the rules the newest Homebrew version of a formula
                        lacks that the version just before it has: python@3.16
                        beside rules for python@3.15 only -- Little Snitch
@@ -2530,6 +2639,66 @@ def t_verify_after_restore(t: T) -> None:
             and str(t.dir / "state") in errs, f"a lost rule is found, the backup named: {errs}")
 
 
+def t_cleanup_asks_about_blocking(t: T) -> None:
+    """A live deny for a part of an allow's remote -- a host of its domain,
+    an address it resolves to -- is `blocks?[<allow ID>]` in list; a host
+    that only ENDS like the domain, a disabled deny and an unrelated one are
+    not. cleanup removes the outdated rules as before; at a terminal, with
+    go, it asks about each blocking deny: remove, keep (recorded, asked no
+    more, and no longer marked), skip (asked again). Without a terminal it
+    asks nothing and changes none of them."""
+    global _resolve, _attended, _ask
+    t.passed_roundtrip()
+    aria = f"path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c"
+    mine: Rule = {"process": aria, "ports": "443", "protocol": "tcp", "uid": t.uid}
+    t.model([
+        {"action": "allow", "remote-domains": "example.org", **mine},                 # 0 the allow
+        {"action": "deny", "remote-hosts": "dl.example.org", **mine},                 # 1 blocks: removed
+        {"action": "deny", "remote-hosts": "cdn.example.org"},                        # 2 blocks: kept
+        {"action": "deny", "remote-addresses": "192.0.2.7", **mine},                  # 3 blocks: skipped
+        {"action": "deny", "remote-hosts": "dl.ample.org", **mine},                   # 4 not a part
+        {"action": "deny", "remote-hosts": "dl.example.org", "disabled": True, **mine},   # 5 off
+        {"action": "deny", "remote-hosts": "other.net", **mine},                      # 6 unrelated
+        {"action": "allow", "process": "path.usr/local/Cellar/python@3.10/*/bin/python3", "remote-domains": "pypi.org"},
+    ])
+    ids = [rule_id(r) for r in t.rules()]
+    answers = ["r", "k", "s"]
+    asked: List[str] = []
+
+    def ask(prompt: str) -> str:
+        asked.append(prompt)
+        return answers.pop(0) if answers else "s"
+
+    old = (_resolve, _attended, _ask)
+    _resolve = lambda name: ["192.0.2.7"] if name == "example.org" else []
+    _attended, _ask = (lambda: False), ask
+    try:
+        _, out, _ = t.run(["list"])
+        marked = sorted(line.split("\t")[0] for line in out.splitlines() if f"blocks?[{ids[0]}]" in line)
+        t.check(marked == sorted(ids[1:4]), f"blocks? on the three, and only them: {marked} {out}")
+        rc, out, errs = t.run(["cleanup"])
+        t.check(rc == 0 and len(out.splitlines()) == 1 and "pypi.org" in out and len(t.rules()) == 8,
+                f"cleanup shows the outdated one, changes nothing: {out} {errs}")
+        t.check("3 deny(s) block part of an allow" in errs and f"{ids[0]} allows example.org" in errs, errs)
+        rc, out, errs = t.run(["cleanup", "go"])
+        t.check(rc == 0 and len(t.rules()) == 7 and not asked and "not asked: no terminal" in errs,
+                f"without a terminal: the outdated removed, nothing asked, the denies left: {asked} {errs}")
+        _attended = lambda: True
+        rc, out, errs = t.run(["cleanup", "go"])
+        now = [rule_id(r) for r in t.rules()]
+        t.check(rc == 0 and len(asked) == 3 and ids[1] not in now and ids[2] in now and ids[3] in now,
+                f"remove, keep, skip: {asked} {errs}")
+        t.check((t.dir / "state" / "kept").read_text().split() == [ids[2]], "keep is recorded by ID")
+        _, out, _ = t.run(["list"])
+        t.check(f"{ids[2]}\t" in out and f"blocks?[{ids[0]}]" not in next(x for x in out.splitlines() if x.startswith(ids[2])),
+                f"a kept deny is no longer marked: {out}")
+        asked.clear()
+        rc, out, errs = t.run(["cleanup", "go"])
+        t.check(rc == 0 and len(asked) == 1 and "192.0.2.7" in asked[0] and f">>> {ids[3]}  " in errs, f"only the skipped one is asked again: {asked}")
+    finally:
+        _resolve, _attended, _ask = old
+
+
 def t_remove_and_cleanup(t: T) -> None:
     t.passed_roundtrip()
     _, out, _ = t.run(["list", "pypi"])
@@ -2812,7 +2981,7 @@ def t_version(t: T) -> None:
 
 TESTS: Final[List[Callable[[T], None]]] = [
     t_list_verdicts, t_allow_shows_then_go, t_allow_clears_beating_denies, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_upgrade_carries_rules, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
-    t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_log_shows_parent, t_refusals, t_lock, t_output_layers, t_create_config,
+    t_verify_after_restore, t_cleanup_asks_about_blocking, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_log_shows_parent, t_refusals, t_lock, t_output_layers, t_create_config,
     t_site_conf_gives_the_bases_the_search_and_the_offer, t_site_conf_cannot_tell_is_an_error, t_config_offer_names_only_searched_paths,
     t_ctrl_c, t_version,
 ]

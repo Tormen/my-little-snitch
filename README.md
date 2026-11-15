@@ -42,6 +42,7 @@ token saying what:
 | `cleanup?[user-gone]` | its owner uid is no user on this machine |
 | `cleanup?[expired]` | an expired temporary rule (Little Snitch's "suggestion") |
 | `allow?[version-path]` | works, but names one Homebrew version: breaks on the next upgrade -- `allow go` its program again, then `remove go` this one |
+| `blocks?[<ID>]` | a deny that wins over a part of allow `<ID>`: a host inside its domain, or an address its host resolves to (Little Snitch prefers the more specific server) |
 
 When the newest version of a versioned Homebrew formula is installed beside
 the one just before it (`python@3.16`, rules for `python@3.15` only), `list`
@@ -135,7 +136,17 @@ removes an allow. An allow already there still loses the denies that beat it.
     my-little-snitch list python@3.10 | cut -f 1 | my-little-snitch remove go
 
 **cleanup** -- the OUTDATED rules, useless because what they name no longer
-exists: exactly the `cleanup?` lines of `list`.
+exists: exactly the `cleanup?` lines of `list`, removed with `go`. Then each
+`blocks?` deny, which only you can judge (a block you meant, or a leftover):
+with `go` at a terminal it asks, one by one,
+
+     >>> 7e20c4  any  deny  dl.example.org  any  anyone
+        > it keeps dl.example.org blocked, which allow 51a0b3 would let through -- [r]emove it  [k]eep it (asked no more)  [s]kip (ask next time)? k
+        > kept: in /var/db/root/my-little-snitch/kept, not asked again
+
+A deny kept is recorded by its ID in `BACKUP_DIR/kept` and is no longer
+marked `blocks?`; an edited rule has a new ID and is asked about again.
+Without a terminal, or without `go`, the `blocks?` denies are shown and left.
 
 **upgrade** -- the rules the newest Homebrew version of a formula lacks that
 the version just before it has: exactly the rules `list` names under "is
