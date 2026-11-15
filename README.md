@@ -232,7 +232,10 @@ A deny you set on purpose is never reported.
   the rule.
 
 **--install [go]** -- the watch job. The plain run checks each part and shows
-it `[ ok ]` or `[FIX]`; `go` fixes them, and a second `go` finds nothing:
+it `[ ok ]` or `[FIX]`; `go` fixes them, and a second `go` finds nothing.
+The job carries, after its DOCTYPE, the owner comment my-rollout reads
+(`<!-- installed by my-little-snitch install (root) on <host>, ...: generated,
+build <id> -->`); a job without it is rewritten, not reloaded:
 
 - the LaunchDaemon `<LAUNCHD_PREFIX>_watch`: `my-little-snitch -Q watch` as
   it was called (the farm's link), every `WATCH_INTERVAL` seconds (default

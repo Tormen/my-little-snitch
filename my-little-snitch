@@ -1948,6 +1948,33 @@ def watch_rule_args(s: Settings) -> Optional[List[str]]:
     return [py, s.watch_ssh_host, kind, "--port", "22", "--owner", "system", "--via", "/usr/bin/ssh"]
 
 
+# The job's owner, for my-rollout: one comment on the line after the DOCTYPE,
+# in the shape every tool's job carries -- "<!-- installed by <tool> <option>
+# (root) on <host>, <local time>: generated, build <id> -->". The option is
+# written without its dashes: an XML comment may not hold "--", and plistlib
+# refuses one that does. Every comparison of the job leaves that line out.
+OWNER_STAMP: Final = f"<!-- installed by {SCRIPT_NAME} install "
+
+
+def build_id() -> str:
+    return hashlib.sha256(Path(os.path.realpath(__file__)).read_bytes()).hexdigest()[:12]
+
+
+def owner_stamped(data: bytes) -> bytes:
+    """DATA, a plist, with the owner comment on the line after its DOCTYPE."""
+    stamp = (f"{OWNER_STAMP}(root) on {_host()}, {time.strftime('%Y-%m-%d %H:%M %z')}: "
+             f"generated, build {build_id()} -->")
+    lines = data.splitlines(True)
+    at = next((i + 1 for i, ln in enumerate(lines) if ln.startswith(b"<!DOCTYPE")), 0)
+    return b"".join(lines[:at] + [stamp.encode() + b"\n"] + lines[at:])
+
+
+def job_body(data: bytes) -> bytes:
+    """DATA without its owner comment: what tells a changed job from an
+    unchanged one (the comment's time and build change on every write)."""
+    return b"".join(ln for ln in data.splitlines(True) if not ln.startswith(OWNER_STAMP.encode()))
+
+
 def cmd_install(s: Settings, args: Sequence[str]) -> int:
     """The watch job, its state and log directories, and the rule for its
     posts: each checked and shown [ ok ] or [FIX]; go fixes them. A second
@@ -1973,9 +2000,11 @@ def cmd_install(s: Settings, args: Sequence[str]) -> int:
     def fix_job() -> str:
         s.launchd_daemon_dir.mkdir(parents=True, exist_ok=True)
         tmp = plist.with_name(f".{plist.name}.{os.getpid()}")
-        tmp.write_bytes(job)
+        tmp.write_bytes(owner_stamped(job))
         os.chmod(tmp, 0o644)
         os.replace(tmp, plist)
+        if same and loaded():
+            return f"owner comment on job {label} (launchd reads no comment: not reloaded)"
         subprocess.run([s.launchctl, "bootout", f"system/{label}"], capture_output=True, timeout=60,
                        stdin=subprocess.DEVNULL)
         r = subprocess.run([s.launchctl, "bootstrap", "system", str(plist)], capture_output=True, text=True,
@@ -1985,10 +2014,13 @@ def cmd_install(s: Settings, args: Sequence[str]) -> int:
         return f"job {label} (every {s.watch_interval} s)"
 
     current = plist.read_bytes() if plist.is_file() else None
-    if current == job and loaded():
+    same = current is not None and job_body(current) == job
+    stamped = current is not None and OWNER_STAMP.encode() in current
+    if same and stamped and loaded():
         OUT.result(f"[ ok ] job {label}: every {s.watch_interval} s, as root")
     else:
-        why = "not installed" if current is None else "differs from this build's" if current != job else "not loaded"
+        why = ("not installed" if current is None else "differs from this build's" if not same
+               else "its owner comment is missing (my-rollout reads it)" if not stamped else "not loaded")
         OUT.result(f"[FIX] job {label}: {why} (every {s.watch_interval} s, as root)")
         fixes.append(("added", fix_job))
     dirs = [d for d in (s.backup_dir, s.watch_log.parent) if not d.is_dir()]
@@ -3307,6 +3339,11 @@ def t_install_watch(t: T) -> None:
             and job.get("StartInterval") == 60 and job.get("EnvironmentVariables") == {"PATH": f"{t.dir}/jobbin"},
             f"the job: {job} {errs}")
     t.check("bootstrap system" in (t.dir / "lc.log").read_text() and log.parent.is_dir(), f"loaded, the log folder made: {errs}")
+    lines = plist.read_text().splitlines() if plist.exists() else []
+    at = next((i for i, ln in enumerate(lines) if ln.startswith("<!DOCTYPE")), -9)
+    t.check(at >= 0 and lines[at + 1].startswith(f"<!-- installed by {SCRIPT_NAME} install (root) on ")
+            and f"generated, build {build_id()} -->" in lines[at + 1] and "--" not in lines[at + 1][4:-3],
+            f"my-rollout's owner comment after the DOCTYPE, no '--' inside: {lines[:4]}")
     added = t.rules()[n:]
     t.check(len(added) == 1 and added[0].get("remote-hosts") == "ada" and added[0].get("ports") == "22"
             and added[0].get("owner") == "system" and added[0].get("via") == "identifier.APPLE/com.apple.ssh"
@@ -3315,6 +3352,11 @@ def t_install_watch(t: T) -> None:
     rc, out, errs = t.run(["--install", "go"])
     t.check(rc == 0 and "[FIX]" not in out and "nothing to fix" in errs and len(t.rules()) == n + 1
             and (t.dir / "lc.log").read_text().count("bootstrap") == 1, f"a second go finds nothing: {out} {errs}")
+    plist.write_bytes(job_body(plist.read_bytes()))
+    rc, out, errs = t.run(["--install", "go"])
+    t.check(rc == 0 and "owner comment is missing" in out and OWNER_STAMP in plist.read_text()
+            and (t.dir / "lc.log").read_text().count("bootstrap") == 1,
+            f"a job without the comment (ada's first install) gets it, not reloaded: {out} {errs}")
     t.extra = base + 'WATCH_INTERVAL="120"\n'
     rc, out, errs = t.run(["--install"])
     t.check(rc == 0 and "differs from this build's" in out and "none needed" in out, f"another interval; no host: {out}")
