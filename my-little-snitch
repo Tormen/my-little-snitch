@@ -29,6 +29,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -510,6 +511,11 @@ def rule_line(r: Rule) -> str:
     return f"{rule_id(r)}\t{cols}" + (f"   {v}" if v else "")
 
 
+def rule_cols(r: Rule) -> str:
+    """A rule as `list` shows it, without the ID."""
+    return rule_line(r).split("\t", 1)[1]
+
+
 # --- 3. programs -------------------------------------------------------------
 
 _CELLAR: Final = re.compile(r"^(?P<pre>.*/Cellar/)(?P<formula>[^/@]+)(?P<at>@[^/]+)?/(?P<ver>[^/]+)/(?P<rest>.*)$")
@@ -747,6 +753,175 @@ def expect_rules(want: List[Rule]) -> Callable[[List[Rule]], List[str]]:
         extra = [m for m in have if m not in asked]
         return [f"missing {m}" for m in missing] + [f"unexpected {m}" for m in extra] or ["the counts differ"]
     return check
+
+
+# --- 4. which rule wins --------------------------------------------------------
+# Little Snitch decides between two rules that match a connection in this
+# order, the first difference deciding (its help, "Concepts - Rules", "Rule
+# precedence"): Priority set; the more specific server (an address, a host, a
+# domain, any); the shorter port range; a protocol over any; a program over
+# any process; a program via a tool over the program alone; an owner over
+# anyone; one direction over both; deny over allow. How two Priority rules
+# compare it does not say: such a pair counts as the deny winning, the safe
+# side for an allow that must work.
+
+def _ports(r: Rule) -> Optional[List[Tuple[int, int]]]:
+    """A rule's ports as ranges -- None for any port; a value it cannot read
+    as numbers, as no ports at all (it then covers nothing)."""
+    p = r.get("ports")
+    if p is None:
+        return None
+    ranges: List[Tuple[int, int]] = []
+    for part in str(p).split(","):
+        low, _, high = part.strip().partition("-")
+        if not (low.isdigit() and (high == "" or high.isdigit())):
+            return []
+        ranges.append((int(low), int(high or low)))
+    return ranges
+
+
+def _ports_cover(deny: Rule, allow: Rule) -> bool:
+    d, a = _ports(deny), _ports(allow)
+    if d is None:
+        return True
+    if a is None:
+        return False
+    return all(any(dl <= al and ah <= dh for dl, dh in d) for al, ah in a)
+
+
+RemoteKindAll = Literal["any", "local-net", "domains", "hosts", "addresses"]
+
+
+def _remote(r: Rule) -> Tuple[RemoteKindAll, List[str]]:
+    for kind in ("domains", "hosts", "addresses"):
+        if f"remote-{kind}" in r:
+            return cast(RemoteKindAll, kind), sorted(x.strip().lower() for x in str(r[f"remote-{kind}"]).split(","))
+    return ("local-net", []) if r.get("remote") == "local-net" else ("any", [])
+
+
+KIND_NAMES: Final[Dict[str, str]] = {"any": "any server", "local-net": "local-net", "domains": "a domain",
+                                    "hosts": "a host", "addresses": "an address"}
+
+
+def _inside(item: str, item_kind: RemoteKindAll, outer: str, outer_kind: RemoteKindAll) -> bool:
+    """Whether a server named `item` is one `outer` names: a domain names
+    itself and every host under it -- a dot before it, so ample.org is not
+    a part of example.org; an address pattern names what it matches."""
+    if outer_kind == "domains" and item_kind in ("domains", "hosts"):
+        return item == outer or item.endswith("." + outer)
+    if outer_kind == item_kind == "hosts":
+        return item == outer
+    if outer_kind == item_kind == "addresses":
+        return fnmatch.fnmatchcase(item, outer)
+    return False
+
+
+def _contains(outer: Rule, inner: Rule) -> bool:
+    """Whether every server `inner` names is one `outer` names."""
+    ok, oi = _remote(outer)
+    ik, ii = _remote(inner)
+    if ok == "any":
+        return True
+    if ok == "local-net" or ik in ("any", "local-net"):
+        return ok == ik
+    return all(any(_inside(i, ik, o, ok) for o in oi) for i in ii)
+
+
+def _owner(r: Rule) -> Tuple[object, object]:
+    return r.get("uid"), r.get("owner")
+
+
+def _direction(r: Rule) -> str:
+    return str(r.get("direction") or "outgoing")
+
+
+def covers_but_server(deny: Rule, allow: Rule) -> bool:
+    """Whether the deny applies to the allow's connections on every axis but
+    the server: its process, via program, owner, protocol and direction are
+    the allow's or any, its ports include the allow's."""
+    return ((deny.get("process") is None or deny.get("process") == allow.get("process"))
+            and ("via" not in deny or deny.get("via") == allow.get("via"))
+            and (_owner(deny) == (None, None) or _owner(deny) == _owner(allow))
+            and (deny.get("protocol") is None or deny.get("protocol") == allow.get("protocol"))
+            and (_direction(deny) == "both" or _direction(deny) == _direction(allow))
+            and _ports_cover(deny, allow))
+
+
+def precedence(deny: Rule, allow: Rule) -> Tuple[bool, str]:
+    """For a deny that covers an allow: whether Little Snitch prefers the
+    deny, and the step of its order that decides."""
+    if deny.get("priority"):
+        return True, "it has Priority set, and Priority wins first"
+    if allow.get("priority"):
+        return False, "this allow has Priority"
+    if _remote(deny) != _remote(allow):
+        return False, f"{KIND_NAMES[_remote(allow)[0]]} beats {KIND_NAMES[_remote(deny)[0]]}"
+    if _ports(deny) != _ports(allow):
+        return False, "the shorter port range"
+    if deny.get("protocol") != allow.get("protocol"):
+        return False, "a protocol beats any protocol"
+    if deny.get("process") != allow.get("process"):
+        return False, "a program beats any process"
+    if deny.get("via") != allow.get("via"):
+        return False, "a program via a tool beats the program alone"
+    if _owner(deny) != _owner(allow):
+        return False, "an owner beats anyone"
+    if _direction(deny) != _direction(allow):
+        return False, "one direction beats both"
+    return True, "the same program, server, port and owner, and a deny beats an allow"
+
+
+def _resolve_dns(name: str) -> List[str]:
+    try:
+        return sorted({str(a[4][0]) for a in socket.getaddrinfo(name, None)})
+    except (OSError, UnicodeError):
+        return []
+
+
+_resolve: Callable[[str], List[str]] = _resolve_dns     # a stand-in in --run-tests: no DNS in a test
+
+
+@dataclass(frozen=True)
+class Standoff:
+    """What the denies of a model do to one allow: those Little Snitch
+    prefers (removed by allow go), those blocking a part of it (left, said),
+    those it wins over (left, -V). Each with why."""
+
+    beating: Tuple[Tuple[Rule, str], ...] = ()
+    blocking: Tuple[Tuple[Rule, str, str], ...] = ()    # the deny, the part it blocks, why it wins there
+    losing: Tuple[Tuple[Rule, str], ...] = ()
+
+
+def standoff(rules: List[Rule], allow: Rule) -> Standoff:
+    """The live denies that apply to `allow`'s connections, sorted by what
+    Little Snitch does with the pair. A disabled deny decides nothing."""
+    beating: List[Tuple[Rule, str]] = []
+    blocking: List[Tuple[Rule, str, str]] = []
+    losing: List[Tuple[Rule, str]] = []
+    resolved: Optional[Dict[str, List[str]]] = None
+    for d in rules:
+        if d.get("action") != "deny" or d.get("disabled") or not covers_but_server(d, allow):
+            continue
+        if _contains(d, allow):
+            wins, why = precedence(d, allow)
+            (beating if wins else losing).append((d, why))
+            continue
+        if allow.get("priority") and not d.get("priority"):
+            continue
+        if _contains(allow, d):
+            blocking.append((d, show_remote(d), f"{KIND_NAMES[_remote(d)[0]]} beats {KIND_NAMES[_remote(allow)[0]]}"))
+            continue
+        dk, di = _remote(d)
+        ak, ai = _remote(allow)
+        if dk == "addresses" and ak in ("domains", "hosts"):
+            if resolved is None:
+                resolved = {name: _resolve(name) for name in ai}
+            for name, addresses in resolved.items():
+                hit = [x for x in addresses if any(fnmatch.fnmatchcase(x, p) for p in di)]
+                if hit:
+                    blocking.append((d, f"{', '.join(hit)}, an address of {name}", "an address beats a host name"))
+                    break
+    return Standoff(tuple(beating), tuple(blocking), tuple(losing))
 
 
 # --- 5. commands -------------------------------------------------------------
@@ -1027,23 +1202,50 @@ def cmd_add(s: Settings, action: str, args: Sequence[str]) -> int:
             OUT.msg(f" >>> {label}: {show_program(r[label])}")
             if p.note:
                 OUT.msg(f"    > {p.note}")
+    wanted: List[Tuple[Rule, str]] = [(r, "")]
     rules = load_rules(s)
-    same = [x for x in rules if rule_meaning(x) == rule_meaning(r)]
-    if same:
-        OUT.msg(f" >>> already there: {rule_line(same[0])}")
+    add: List[Tuple[Rule, str]] = []
+    gone: Dict[str, Rule] = {}
+    for w, note in wanted:
+        same = [x for x in rules if rule_meaning(x) == rule_meaning(w)]
+        if same:
+            OUT.msg(f" >>> already there: {rule_line(same[0])}")
+        else:
+            add.append((w, note))
+        if action != "allow":
+            continue        # a deny never removes an allow
+        so = standoff(rules, w)
+        for d, why in so.beating:
+            if rule_key(d) not in gone:
+                gone[rule_key(d)] = d
+                OUT.msg(f" >>> {'removing' if a.go else 'would remove'} {rule_id(d)}: {rule_cols(d)}")
+                OUT.msg(f"    > it wins over this allow: {why}")
+        for d, part, why in so.blocking:
+            OUT.msg(f" >>> deny {rule_id(d)} is left: it blocks {part}, part of this allow")
+            OUT.msg(f"    > {why} in Little Snitch's order; remove it by hand if it is not wanted: "
+                    f"{SCRIPT_NAME} remove {rule_id(d)} go")
+        for d, why in so.losing:
+            OUT.det(f"    > deny {rule_id(d)} is left: {show_process(d)}, {show_remote(d)} -- this allow wins ({why})")
+    if not add and not gone:
         return 0
-    shown = rule_line(r).split("\t", 1)[1]
     say_temporaries(rules)
     if not a.go:
-        OUT.msg(f" >>> would add: {shown}")
-        OUT.msg(f"    > '{SCRIPT_NAME} {action} go {shlex.join(args)}' adds it")
+        for w, note in add:
+            OUT.msg(f" >>> would add: {rule_cols(w)}" + (f"   ({note})" if note else ""))
+        OUT.msg(f"    > '{SCRIPT_NAME} {action} go {shlex.join(args)}' " + ("does it" if gone else "adds it"))
         return 0
-    want = rules + [r]
-    backup = change_model(s, lambda now: now + [r], expect_rules(want))
-    OUT.msg(f" >>> added: {shown}  [rules {len(rules)} -> {len(want)}]")
+    new = [w for w, _ in add]
+    want = [x for x in rules if rule_key(x) not in gone] + new
+    backup = change_model(s, lambda now: [x for x in now if rule_key(x) not in gone] + new, expect_rules(want))
+    count = f"  [rules {len(rules)} -> {len(want)}]"
+    for k, (w, note) in enumerate(add, 1):
+        OUT.msg(f" >>> added: {rule_cols(w)}" + (f"   ({note})" if note else "") + (count if k == len(add) else ""))
+    if gone:
+        OUT.msg(f"    > removed {len(gone)} deny(s); all of it is in {backup}" + ("" if add else count))
     OUT.msg(f"    > stored and read back -- proven only by a connection it lets through: "
             f"{SCRIPT_NAME} log {shlex.quote(a.via or (a.remote if a.process == 'any' else a.process))}")
-    OUT.det(f"    > the rules before: {backup}")
+    if not gone:
+        OUT.det(f"    > the rules before: {backup}")
     return 0
 
 
@@ -1337,7 +1539,11 @@ RULES
   allow [go] <PROCESS> <REMOTE> [--incoming] [--port <N>|any] [--udp|--icmp] [--host|--address] [--owner <USER>|anyone|system] [--via <PROGRAM>]
   deny  [go] <PROCESS> <REMOTE> ...
                        shows the rule it would add; with go, adds it (one
-                       already there is said, not doubled).
+                       already there is said, not doubled). allow also
+                       removes, in the same change, the denies Little Snitch
+                       would prefer over it: one with Priority, or the same
+                       rule as a deny; a deny for a part of its remote (a
+                       host, an address it resolves to) is left and said.
                          PROCESS  any, a path, or a name found on $PATH
                                   (aria2c). A signed program is its code
                                   identity, as Little Snitch stores it:
@@ -1881,6 +2087,66 @@ def t_allow_shows_then_go(t: T) -> None:
             f"for any process the proof is the remote's log, not 'log any': {errs}")
     t.check(rc == 0 and "process" not in new and "uid" not in new and "ports" not in new and new["action"] == "deny",
             f"any process, anyone, any port: {new} {errs}")
+
+
+def t_allow_clears_beating_denies(t: T) -> None:
+    """allow go removes exactly the denies Little Snitch would prefer: one
+    tying with it down to the direction, one with Priority. It leaves, and
+    says, a deny inside its remote (a host, an address the remote resolves
+    to); it leaves a deny the allow wins over (-V names it), a disabled one,
+    another port, and a deny for a domain that merely ENDS like the allowed
+    one (ample.org is not a part of example.org)."""
+    global _resolve
+    t.passed_roundtrip()
+    aria = f"path.{str(t.cellar)[1:]}/aria2/*/bin/aria2c"
+    mine: Rule = {"process": aria, "ports": "443", "protocol": "tcp", "uid": t.uid}
+    t.model([
+        {"action": "deny", "remote-domains": "example.org", **mine},                              # 0 ties: removed
+        {"action": "deny", "remote-domains": "example.org", "ports": "443", "protocol": "tcp"},   # 1 any process: left
+        {"action": "deny", "remote-hosts": "dl.example.org", **mine},                             # 2 inside: said
+        {"action": "deny", "remote-addresses": "192.0.2.7", **mine},                              # 3 its address: said
+        {"action": "deny", "remote-domains": "example.org", "priority": True},                    # 4 Priority: removed
+        {"action": "deny", "remote-domains": "example.org", "disabled": True, **mine},            # 5 off: nothing
+        {"action": "deny", "remote-domains": "example.org", **dict(mine, ports="80")},            # 6 other port
+        {"action": "deny", "remote-domains": "ample.org", "priority": True},                      # 7 not a part
+        {"action": "allow", "remote-domains": "keep.org", **mine},
+    ])
+    ids = [rule_id(r) for r in t.rules()]
+    old = _resolve
+    _resolve = lambda name: ["192.0.2.7"] if name == "example.org" else []
+    try:
+        rc, _, errs = t.run(["-V", "allow", "aria2c", "example.org"])
+        t.check(rc == 0 and len(t.rules()) == 9, f"without go nothing changes: {errs}")
+        t.check(f"would remove {ids[0]}: " in errs and f"would remove {ids[4]}: " in errs
+                and errs.count("would remove") == 2, f"the two that win, and only they: {errs}")
+        t.check("a deny beats an allow" in errs and "Priority" in errs, f"each with its reason: {errs}")
+        t.check(f"deny {ids[2]} is left: it blocks dl.example.org, part of this allow" in errs
+                and f"remove {ids[2]} go" in errs, f"a host inside, said with its remove line: {errs}")
+        t.check(f"deny {ids[3]} is left: it blocks 192.0.2.7, an address of example.org" in errs, f"#15: {errs}")
+        t.check(f"deny {ids[1]} is left: any, example.org -- this allow wins (a program beats any process)" in errs,
+                f"-V: a deny the allow wins over: {errs}")
+        t.check(not any(f"{ids[k]}" in errs for k in (5, 6, 7)), f"off, another port, not a part: unmentioned: {errs}")
+        rc, _, errs = t.run(["allow", "aria2c", "example.org"])
+        t.check(rc == 0 and f"deny {ids[1]} is left" not in errs, f"the loser only with -V: {errs}")
+        rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
+        now = [rule_id(r) for r in t.rules()]
+        t.check(rc == 0 and ids[0] not in now and ids[4] not in now and len(t.rules()) == 8,
+                f"go removes the two and adds the allow, in one change: {len(t.rules())} {errs}")
+        t.check(f"removing {ids[0]}: " in errs and "removed 2 deny" in errs
+                and len(list((t.dir / "state").glob("*.json"))) == 1, f"named, under one backup: {errs}")
+        t.check(all(i in now for i in (ids[1], ids[2], ids[3], ids[5], ids[6], ids[7])), f"the rest stays: {errs}")
+        rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
+        t.check(rc == 0 and "already there" in errs and "removing" not in errs and "removed" not in errs
+                and len(t.rules()) == 8, f"a second run changes nothing: {errs}")
+        t.model(t.rules() + [{"action": "deny", "remote-domains": "example.org", **mine}])
+        rc, _, errs = t.run(["allow", "go", "aria2c", "example.org"])
+        t.check(rc == 0 and "removed 1 deny" in errs and len(t.rules()) == 8,
+                f"an allow already there loses a deny added later: {errs}")
+        rc, _, errs = t.run(["deny", "go", "aria2c", "keep.org"])
+        t.check(rc == 0 and any(r.get("remote-domains") == "keep.org" and r["action"] == "allow" for r in t.rules()),
+                f"deny never removes an allow: {errs}")
+    finally:
+        _resolve = old
 
 
 def t_allow_incoming(t: T) -> None:
@@ -2545,7 +2811,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_upgrade_carries_rules, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_clears_beating_denies, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_upgrade_carries_rules, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
     t_verify_after_restore, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_log_shows_parent, t_refusals, t_lock, t_output_layers, t_create_config,
     t_site_conf_gives_the_bases_the_search_and_the_offer, t_site_conf_cannot_tell_is_an_error, t_config_offer_names_only_searched_paths,
     t_ctrl_c, t_version,

@@ -106,6 +106,30 @@ The rule's proof is the via program's log (`log curl`): it is what connects.
 
     my-little-snitch allow go /usr/local/bin/fetch.sh example.org --via curl
 
+**allow clears the denies that beat it.** Little Snitch decides between two
+rules that match a connection in this order (its help, "Rule precedence"),
+the first difference deciding: Priority set; the more specific server (an
+address, a host, a domain, any); the shorter port range; a protocol over any;
+a program over any process; a program via a tool over the program alone; an
+owner over anyone; one direction over both; deny over allow. So `allow`
+removes, in the same change and under the same backup, each live deny that
+covers its connections (the same server or one containing it, ports
+including its own, the same program or any, the same owner or anyone) and
+wins that order: it has Priority, or it is the same rule as a deny. Each is
+named with its ID and the step that decides:
+
+    my-little-snitch allow go aria2c example.org
+     >>> removing 1d8939: /opt/homebrew/Cellar/aria2/*/bin/aria2c  deny  example.org  tcp/443  alice
+        > it wins over this allow: the same program, server, port and owner, and a deny beats an allow
+     >>> added: /opt/homebrew/Cellar/aria2/*/bin/aria2c  allow  example.org  tcp/443  alice  [rules 812 -> 812]
+        > removed 1 deny(s); all of it is in /var/db/root/my-little-snitch/2026-11-07_141502.json
+
+A deny for a part of the allow's remote -- a host of the allowed domain, or
+an address the allowed host resolves to -- wins there, and may be meant: it
+is left, and said with the line that removes it. A deny the allow wins over
+(any process, a wider port range) is left; `-V` names it. `deny` never
+removes an allow. An allow already there still loses the denies that beat it.
+
 **remove** -- by ID, as arguments or one per line on stdin:
 
     my-little-snitch list python@3.10 | cut -f 1 | my-little-snitch remove go
