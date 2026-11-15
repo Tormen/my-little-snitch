@@ -274,7 +274,8 @@ folder off `JOB_PATH` (`/LINKS/bin`) is named by its full path in `MY_AI`.
 
 1. exports the model -- the backup, `BACKUP_DIR/<local time to the microsecond>.json`
    (0600); after a change that went through, only the newest `BACKUP_KEEP`
-   (default 50) stay, and the line removing older ones says so
+   (default 50) stay: older ones are deleted for good, not moved to a Trash,
+   which would keep the disk the limit frees -- and the line says so
 2. changes a copy
 3. exports again; if a rule was added, removed or edited since step 1, it
    refuses and names it: restoring would undo that. What Little Snitch

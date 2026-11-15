@@ -119,7 +119,8 @@ LITTLESNITCH="/Applications/Little Snitch.app/Contents/Components/littlesnitch"
 ## the site file (/var/db without it), the user, the tool. Root only (0700).
 BACKUP_DIR="$DATA_BASE_DIR/$USER/my-little-snitch"
 
-## how many of those backups are kept: after each change, the older ones go
+## how many of those backups are kept: after each change, the older ones are
+## deleted for good (not to a Trash: that would keep the disk they free)
 BACKUP_KEEP="50"
 
 ## the owner of a new rule when --owner is not given: a user name (Little
@@ -799,14 +800,16 @@ _BACKUP_NAME: Final = "????-??-??_??????*.json"    # change_model's backups, old
 
 def prune_backups(s: Settings) -> None:
     """Only the newest BACKUP_KEEP backups stay: one is written per change,
-    2-3 MB each, and nothing else ever removes them. Run after a change
-    that went through -- a failed one keeps its backup, the remedy."""
+    2-3 MB each, and nothing else ever removes them. Deleted for good, not
+    moved to a Trash: keeping them there would keep the disk the limit is
+    there to free. Run after a change that went through -- a failed one
+    keeps its backup, the remedy."""
     backups = sorted(s.backup_dir.glob(_BACKUP_NAME))
     old = backups[:-s.backup_keep]
     for f in old:
         f.unlink()
     if old:
-        OUT.msg(f"    > removed {len(old)} old backup(s) (BACKUP_KEEP {s.backup_keep}): {old[0].name} .. {old[-1].name}")
+        OUT.msg(f"    > deleted {len(old)} old backup(s) for good (BACKUP_KEEP {s.backup_keep}): {old[0].name} .. {old[-1].name}")
 
 
 def temporary(r: Rule) -> bool:
@@ -3181,7 +3184,7 @@ def t_backups_are_pruned(t: T) -> None:
     left = sorted(f.name for f in state.glob("????-??-??_??????*.json"))
     t.check(rc == 0 and len(left) == 3 and left[:2] == ["2026-10-04_120000.json", "2026-10-05_120000.json"],
             f"the newest 3 left, the new backup among them: {left} {errs}")
-    t.check("removed 3 old backup(s) (BACKUP_KEEP 3)" in errs, f"said, with the setting: {errs}")
+    t.check("deleted 3 old backup(s) for good (BACKUP_KEEP 3)" in errs, f"said, with the setting: {errs}")
     t.check(all(f.exists() for f in others) and (state / ROUNDTRIP_OK).exists(), "nothing else touched")
     t.mode("lossy")
     rc, _, errs = t.run(["allow", "go", "aria2c", "y.org"])
