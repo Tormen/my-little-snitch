@@ -225,8 +225,8 @@ A deny you set on purpose is never reported.
   empty history means Little Snitch keeps none, and the watch sees nothing.
 - **A connection held at an alert is not seen:** while Little Snitch holds
   it, it is in no source (not in the traffic history, not in Little Snitch's
-  own log, not as a socket), and a cancelled alert leaves no row. Only a
-  later Deny shows.
+  own log, not as a socket, and no line of the macOS log names the program
+  or its host), and a cancelled alert leaves no row. Only a later Deny shows.
 - **At a terminal** it prints what it would send, sends nothing and keeps no
   state, so the job's next run still sees it all.
 - Its state -- where the last run's read ended, what it sent, the queue --
