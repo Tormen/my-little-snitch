@@ -126,16 +126,16 @@ OWNER_DEFAULT=""
 ## where 'allow aria2c' looks for a bare program name, after $PATH
 PROGRAM_PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin"
 
-## watch: the my-ai session it posts each new denied connection to; how
-## often one still denied is posted again; how long the traffic history may
+## watch: the my-ai session it sends each new denied connection to; how
+## often one still denied is sent again; how long the traffic history may
 ## stay empty before it says it cannot watch (a number and s, m, h or d)
 WATCH_TO="watcher"
 WATCH_REPEAT="1d"
 WATCH_SILENT="1d"
-## my-ai, which posts: a path, or a name found on JOB_PATH
+## my-ai, which sends them (my-ai send): a path, or a name found on JOB_PATH
 MY_AI="my-ai"
-## the host my-ai post reaches by ssh from this machine (my-ai's SESSION_HOST),
-## a host name or an address; "" where my-ai post stays on this machine
+## the host my-ai reaches by ssh from this machine (my-ai's SESSION_HOST),
+## a host name or an address; "" where my-ai stays on this machine
 WATCH_SSH_HOST=""
 
 ## --install: the watch job -- its launchd label is LAUNCHD_PREFIX_watch, it
@@ -1680,9 +1680,9 @@ def cmd_diag(s: Settings, args: Sequence[str]) -> int:
 # --- watch ----------------------------------------------------------------------
 
 WATCH_LAST: Final = "watch.last"         # in BACKUP_DIR: where the last run's read ended (epoch)
-WATCH_SEEN: Final = "watch.seen"         # key TAB first TAB posted TAB denied, per connection posted
+WATCH_SEEN: Final = "watch.seen"         # key TAB first TAB sent TAB denied, per connection sent
 WATCH_TRAFFIC: Final = "watch.traffic"   # when a run last read any traffic (epoch)
-WATCH_QUEUE: Final = "watch.queue"       # queued TAB retries TAB line, per post not yet delivered
+WATCH_QUEUE: Final = "watch.queue"       # queued TAB retries TAB line, per message not yet delivered
 
 
 def write_state(path: Path, lines: List[str]) -> None:
@@ -1778,7 +1778,7 @@ def _owner_of(uid: str) -> str:
 
 @dataclass
 class Denied:
-    """One denied connection, as watch posts it: program, parent, remote,
+    """One denied connection, as watch sends it: program, parent, remote,
     port, owner -- and what this run read of it."""
 
     exe: str
@@ -1804,15 +1804,19 @@ def _host() -> str:
     return socket.gethostname().split(".")[0]
 
 
-def post(s: Settings, line: str) -> Tuple[bool, str]:
-    """my-ai post WATCH_TO LINE: whether it went out, and why not. MY_AI is
+def send_line(s: Settings, line: str) -> Tuple[bool, str]:
+    """my-ai send WATCH_TO --as "app my-little-snitch" LINE: whether it went
+    out, and why not. send stores the line in the session's inbox and my-ai
+    delivers it when the session is idle (post would be refused while it
+    works); run by root, my-ai becomes its session user itself. MY_AI is
     found on JOB_PATH only -- the PATH the job runs with -- so a run at a
     terminal finds what the job finds."""
     prog = s.my_ai if "/" in s.my_ai else shutil.which(s.my_ai, path=s.job_path)
     if not prog:
         return False, f"no {s.my_ai} on JOB_PATH"
     try:
-        r = subprocess.run([prog, "post", s.watch_to, line], capture_output=True, text=True, timeout=120,
+        r = subprocess.run([prog, "send", s.watch_to, "--as", f"app {SCRIPT_NAME}", line],
+                           capture_output=True, text=True, timeout=120,
                            stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, str(e)
@@ -1821,7 +1825,7 @@ def post(s: Settings, line: str) -> Tuple[bool, str]:
 
 
 def deliver(s: Settings, lines: List[str], now: float) -> None:
-    """The queue first, oldest first, then LINES; once one post fails, it and
+    """The queue first, oldest first, then LINES; once one send fails, it and
     everything after it wait in the queue for the next run."""
     path = s.backup_dir / WATCH_QUEUE
     queue = [q.split("\t", 2) for q in read_state(path)] + [[str(int(now)), "0", line] for line in lines]
@@ -1833,18 +1837,18 @@ def deliver(s: Settings, lines: List[str], now: float) -> None:
         late = int(queued) < int(now)
         text = line + (f" (queued {datetime.datetime.fromtimestamp(int(queued)):%H:%M}, sent "
                        f"{datetime.datetime.fromtimestamp(now):%H:%M} [{retries} retries])" if late else "")
-        ok, why = post(s, text)
+        ok, why = send_line(s, text)
         if ok:
-            OUT.msg(f" >>> posted to {s.watch_to}: {text}")
+            OUT.msg(f" >>> sent to {s.watch_to}: {text}")
         else:
-            OUT.warn(f"not posted to {s.watch_to}, queued: {why}")
+            OUT.warn(f"not sent to {s.watch_to}, queued: {why}")
             left.append(f"{queued}\t{int(retries) + 1}\t{line}")
     write_state(path, left)
 
 
 def cmd_watch(s: Settings, args: Sequence[str]) -> int:
     """What Little Snitch denied since the last run that no deny rule asked
-    for. Run by the job, it posts each to WATCH_TO -- once, then every
+    for. Run by the job, it sends each to WATCH_TO -- once, then every
     WATCH_REPEAT while it keeps happening -- and says the same of what keeps
     it from watching; at a terminal it only shows, and keeps no state."""
     if args:
@@ -1857,7 +1861,7 @@ def cmd_watch(s: Settings, args: Sequence[str]) -> int:
     start = datetime.datetime.fromtimestamp(float(last[0]) if last else now - 2 * s.watch_interval,
                                             datetime.timezone.utc)
     seen: Dict[str, List[str]] = {line.split("\t")[0]: line.split("\t") for line in read_state(s.backup_dir / WATCH_SEEN)}
-    posts: List[str] = []
+    messages: List[str] = []
     here = f"{SCRIPT_NAME}@{_host()}"
 
     def due(key: str) -> bool:
@@ -1865,15 +1869,15 @@ def cmd_watch(s: Settings, args: Sequence[str]) -> int:
 
     def notice(key: str, text: str) -> None:
         if due(key):
-            posts.append(f"{here}: {text}")
+            messages.append(f"{here}: {text}")
             seen[key] = [key, str(int(now)), str(int(now)), "0"]
 
     def finish() -> None:
         if attended:
-            for line in posts:
+            for line in messages:
                 OUT.result(line)
             return
-        deliver(s, posts, now)
+        deliver(s, messages, now)
         write_state(s.backup_dir / WATCH_SEEN, ["\t".join(v) for v in seen.values()])
         write_state(s.backup_dir / WATCH_LAST, [str(now)])
 
@@ -1902,7 +1906,7 @@ def cmd_watch(s: Settings, args: Sequence[str]) -> int:
         name = shlex.quote(os.path.basename(d.exe) or "?")
         if d.key not in seen:
             first = (d.first or start).astimezone()
-            posts.append(f"{here}: {d.what}, {d.denied} denied, {first:%H:%M:%S}) -- no deny rule asked for it: "
+            messages.append(f"{here}: {d.what}, {d.denied} denied, {first:%H:%M:%S}) -- no deny rule asked for it: "
                          f"{SCRIPT_NAME} log {name} --denied")
             seen[d.key] = [d.key, str(int(now)), str(int(now)), str(d.denied)]
             continue
@@ -1910,7 +1914,7 @@ def cmd_watch(s: Settings, args: Sequence[str]) -> int:
         seen[d.key][3] = str(total)
         if due(d.key):
             since = datetime.datetime.fromtimestamp(float(seen[d.key][1]))
-            posts.append(f"{here}: {d.what}, {total} denied since {since:%Y-%m-%d %H:%M}) -- still, no deny rule asked for it")
+            messages.append(f"{here}: {d.what}, {total} denied since {since:%Y-%m-%d %H:%M}) -- still, no deny rule asked for it")
             seen[d.key][2] = str(int(now))
     traffic = read_state(s.backup_dir / WATCH_TRAFFIC)
     if rows or not traffic:
@@ -1922,27 +1926,27 @@ def cmd_watch(s: Settings, args: Sequence[str]) -> int:
     queued = read_state(s.backup_dir / WATCH_QUEUE)
     finish()
     span = f"{start.astimezone():%H:%M:%S}-{datetime.datetime.fromtimestamp(now):%H:%M:%S}"
-    new = sum(1 for line in posts if " DENIED " in line)
+    new = sum(1 for line in messages if " DENIED " in line)
     tail = ""
     if attended and queued:
         oldest = datetime.datetime.fromtimestamp(int(queued[0].split("\t")[0]))
-        tail = f"; {len(queued)} post(s) queued since {oldest:%H:%M}"
-    OUT.msg(f" >>> {span}: {len(rows)} connection(s) read, " + (f"{new} to post" if new else "nothing new denied") + tail)
+        tail = f"; {len(queued)} message(s) queued since {oldest:%H:%M}"
+    OUT.msg(f" >>> {span}: {len(rows)} connection(s) read, " + (f"{new} to send" if new else "nothing new denied") + tail)
     return 0
 
 
-def cmd_test_post(s: Settings, args: Sequence[str]) -> int:
+def cmd_test_send(s: Settings, args: Sequence[str]) -> int:
     """ONE test line to WATCH_TO by exactly watch's path; an error when it
     does not go out -- never queued: it is the proof the path works."""
     if args:
-        err("00067", "--test-post takes nothing")
-    phase("posting a test line")
-    line = (f"{SCRIPT_NAME}@{_host()}: test post by the watch's path, as {pwd.getpwuid(_geteuid()).pw_name}, "
+        err("00067", "--test-send takes nothing")
+    phase("sending a test line")
+    line = (f"{SCRIPT_NAME}@{_host()}: test message by the watch's path, as {pwd.getpwuid(_geteuid()).pw_name}, "
             f"{datetime.datetime.now():%Y-%m-%d %H:%M}, config {' + '.join(map(str, s.files))} -- no action needed")
-    ok, why = post(s, line)
+    ok, why = send_line(s, line)
     if not ok:
-        err("00068", f"test post to {s.watch_to} not sent: {why}")
-    OUT.msg(f" >>> test post sent to {s.watch_to} {why}")
+        err("00068", f"test message to {s.watch_to} not sent: {why}")
+    OUT.msg(f" >>> test message sent to {s.watch_to} {why}")
     return 0
 
 
@@ -1955,14 +1959,15 @@ def _self_path() -> str:
 
 
 def watch_rule_args(s: Settings) -> Optional[List[str]]:
-    """The allow command for the watch's posts by ssh to WATCH_SSH_HOST: the
-    job's python3 (found on JOB_PATH, as launchd runs it) via ssh, port 22,
-    owner system (the job is root's). None where my-ai post stays here."""
+    """The allow command for the watch's messages by ssh to WATCH_SSH_HOST:
+    the job's python3 (found on JOB_PATH, as launchd runs it) via ssh, port
+    22, for anyone -- my-ai runs the ssh as its session user, whom my-ai
+    alone knows; the rule keeps no copy of it. None where my-ai stays here."""
     if not s.watch_ssh_host:
         return None
     py = shutil.which("python3", path=s.job_path) or sys.executable
     kind = "--address" if _ADDRESS.fullmatch(s.watch_ssh_host) else "--host"
-    return [py, s.watch_ssh_host, kind, "--port", "22", "--owner", "system", "--via", "/usr/bin/ssh"]
+    return [py, s.watch_ssh_host, kind, "--port", "22", "--owner", "anyone", "--via", "/usr/bin/ssh"]
 
 
 # The job's owner, for my-rollout: one comment on the line after the DOCTYPE,
@@ -1994,7 +1999,7 @@ def job_body(data: bytes) -> bytes:
 
 def cmd_install(s: Settings, args: Sequence[str]) -> int:
     """The watch job, its state and log directories, and the rule for its
-    posts: each checked and shown [ ok ] or [FIX]; go fixes them. A second
+    messages: each checked and shown [ ok ] or [FIX]; go fixes them. A second
     go finds nothing."""
     if args not in ([], ["go"]):
         err("00065", "--install [go] -- it takes nothing else")
@@ -2053,13 +2058,13 @@ def cmd_install(s: Settings, args: Sequence[str]) -> int:
         OUT.result(f"[ ok ] state and log directories: {s.backup_dir}, {s.watch_log.parent}")
     rule = watch_rule_args(s)
     if rule is None:
-        OUT.result("[ ok ] rule: none needed (WATCH_SSH_HOST is empty: my-ai post stays on this machine)")
+        OUT.result("[ ok ] rule: none needed (WATCH_SSH_HOST is empty: my-ai stays on this machine)")
     else:
         r, _, _, _ = new_rule(s, "allow", parse_rule_args("allow", rule))
         if any(rule_meaning(x) == rule_meaning(r) for x in load_rules(s)):
             OUT.result(f"[ ok ] rule: {rule_cols(r)}")
         else:
-            OUT.result(f"[FIX] rule: {rule_cols(r)} (the watch's posts go by ssh to {s.watch_ssh_host})")
+            OUT.result(f"[FIX] rule: {rule_cols(r)} (the watch's messages go by ssh to {s.watch_ssh_host})")
 
             def fix_rule() -> str:
                 cmd_add(s, "allow", ["go", *rule])
@@ -2196,10 +2201,10 @@ TRAFFIC
                        on ada, 14 months (2025-08-13 on 2026-10-28)
   watch                what Little Snitch denied since the last run that no
                        deny rule asked for -- a program that needs a rule.
-                       Run by the job: posts each to the my-ai session
+                       Run by the job: sends each to the my-ai session
                        WATCH_TO, once and then every WATCH_REPEAT, and says
                        so when it cannot watch (Little Snitch unreadable, no
-                       traffic for WATCH_SILENT); a post that cannot go out
+                       traffic for WATCH_SILENT); a message that cannot go out
                        waits in a queue. At a terminal it only shows. A
                        connection held at an alert is not seen: Little
                        Snitch shows it nowhere
@@ -2209,9 +2214,9 @@ ADMIN
   diag events [--since 10m]   Little Snitch's own messages
   --install [go]       the watch job (a LaunchDaemon, every
                        WATCH_INTERVAL s), its state and log directories, and
-                       the rule for its posts; shows what is missing, go
+                       the rule for its messages; shows what is missing, go
                        sets it up
-  --test-post          one test line to WATCH_TO by exactly watch's path
+  --test-send          one test line to WATCH_TO by exactly watch's path
                        (MY_AI on JOB_PATH); an error when it does not go out
 
 OPTIONS
@@ -2272,7 +2277,7 @@ def parse_cli(argv: Sequence[str]) -> Cli:
             if not v:
                 err("00049", "--config needs a <FILE>")
             c.config = v
-        elif a in ("--install", "--test-post") and c.command is None:
+        elif a in ("--install", "--test-send") and c.command is None:
             c.command = a
         elif a in ("-h", "--help"):
             c.command = "help"
@@ -2342,8 +2347,8 @@ def run(argv: Sequence[str]) -> int:
         return cmd_watch(s, c.args)
     if c.command == "--install":
         return cmd_install(s, c.args)
-    if c.command == "--test-post":
-        return cmd_test_post(s, c.args)
+    if c.command == "--test-send":
+        return cmd_test_send(s, c.args)
     return cmd_diag(s, c.args)
 
 
@@ -2360,7 +2365,7 @@ _{SCRIPT_NAME.replace('-', '_')}() {{
     _describe command cmds
     _arguments '-Q[quiet]' '-V[verbose]' '-D[debug]' '--config[config file]:file:_files' \\
       '--create-config[the default config]' '--run-tests[the built-in tests]' '--version[the exact build]' \\
-      '--install[the watch job]' '--test-post[one test post by the watch path]'
+      '--install[the watch job]' '--test-send[one test message by the watch path]'
     return
   fi
   case $words[2] in
@@ -3241,19 +3246,20 @@ def t_cleanup_asks_about_blocking(t: T) -> None:
         _resolve, _attended, _ask = old
 
 
-def t_watch_posts_new_denies(t: T) -> None:
+def t_watch_sends_new_denies(t: T) -> None:
     """watch, as the job: a connection Little Snitch denied that no deny rule
-    covers is posted once (its rows summed), again after WATCH_REPEAT; one a
+    covers is sent once (its rows summed), again after WATCH_REPEAT; one a
     deny rule covers never -- and a deny for le.org does not cover
-    files.example.org. A post my-ai cannot make waits in the queue and goes
+    files.example.org. A message my-ai cannot take waits in the queue and goes
     out late, marked so. An empty history past WATCH_SILENT and an
-    unreadable Little Snitch are posted too. At a terminal it posts nothing
+    unreadable Little Snitch are sent too. At a terminal it sends nothing
     and keeps no state."""
     global _attended
     t.passed_roundtrip()
     ai = t.dir / "my-ai"
     ai.write_text('#!/bin/sh\nd=$(dirname "$0")\n[ -e "$d/ai-busy" ] && { echo "the watcher is busy" >&2; exit 1; }\n'
-                  'printf \'%s\\n\' "$3" >> "$d/posts.log"\n')
+                  '[ "$1 $2 $3 $4" = "send watcher --as app my-little-snitch" ] || { echo "called: $*" >&2; exit 2; }\n'
+                  'printf \'%s\\n\' "$5" >> "$d/posts.log"\n')
     ai.chmod(0o755)
     t.extra = f'MY_AI="{ai}"\n'
     aria = f"{t.cellar}/aria2/1.37.0/bin/aria2c"
@@ -3283,7 +3289,7 @@ def t_watch_posts_new_denies(t: T) -> None:
         t.check(not any("evil.example" in x for x in posts()), "a deny rule asked for evil.example")
         traffic(("files.example.org", 4), ahead=5)
         rc, _, errs = t.run(["watch"])
-        t.check(rc == 0 and len(posts()) == 1, f"seen: not posted again within WATCH_REPEAT: {posts()} {errs}")
+        t.check(rc == 0 and len(posts()) == 1, f"seen: not sent again within WATCH_REPEAT: {posts()} {errs}")
         seen = (state / WATCH_SEEN).read_text()
         t.check(seen.rstrip().endswith("\t7"), f"but counted: {seen!r}")
         (state / WATCH_SEEN).write_text(re.sub(r"\t(\d+)\t(\d+)\t7", r"\t\1\t0\t7", seen))
@@ -3295,7 +3301,7 @@ def t_watch_posts_new_denies(t: T) -> None:
         traffic(("other.example", 1), ahead=15)
         rc, _, errs = t.run(["watch"])
         t.check(rc == 0 and len(posts()) == 2 and len(read_state(state / WATCH_QUEUE)) == 1
-                and "queued: [rc 1] the watcher is busy" in errs, f"queued while my-ai cannot post: {errs}")
+                and "queued: [rc 1] the watcher is busy" in errs, f"queued while my-ai cannot take it: {errs}")
         (t.dir / "ai-busy").unlink()
         queue = read_state(state / WATCH_QUEUE)[0].split("\t")
         write_state(state / WATCH_QUEUE, [f"{int(queue[0]) - 300}\t{queue[1]}\t{queue[2]}"])
@@ -3312,7 +3318,7 @@ def t_watch_posts_new_denies(t: T) -> None:
         traffic(("attended.example", 1), ahead=25)
         rc, out, errs = t.run(["watch"])
         t.check(rc == 0 and len(posts()) == 4 and "attended.example" in out
-                and (state / WATCH_SEEN).read_text() == before, f"at a terminal: shown, not posted, no state: {out} {errs}")
+                and (state / WATCH_SEEN).read_text() == before, f"at a terminal: shown, not sent, no state: {out} {errs}")
         _attended = lambda: False
         t.mode("unauthorized")
         rc, _, errs = t.run(["watch"])
@@ -3322,35 +3328,36 @@ def t_watch_posts_new_denies(t: T) -> None:
         _attended = old
 
 
-def t_test_post(t: T) -> None:
-    """--test-post sends ONE line by exactly watch's path (MY_AI found on
-    JOB_PATH, post to WATCH_TO) and says so with my-ai's rc; when my-ai
-    cannot post -- refused, or not on JOB_PATH at all, as /LINKS/bin's was
+def t_test_send(t: T) -> None:
+    """--test-send sends ONE line by exactly watch's path (MY_AI found on
+    JOB_PATH, my-ai send to WATCH_TO) and says so with my-ai's rc; when my-ai
+    cannot take it -- refused, or not on JOB_PATH at all, as /LINKS/bin's was
     not on macado (look 153334) -- it fails, and queues nothing."""
     ai = t.dir / "ai" / "my-ai"
     ai.parent.mkdir()
     ai.write_text('#!/bin/sh\nd=$(dirname "$0")\n[ -e "$d/busy" ] && { echo "the watcher is busy" >&2; exit 1; }\n'
-                  'printf \'%s %s\\n\' "$2" "$3" >> "$d/posts.log"\n')
+                  '[ "$1 $3 $4" = "send --as app my-little-snitch" ] || { echo "called: $*" >&2; exit 2; }\n'
+                  'printf \'%s %s\\n\' "$2" "$5" >> "$d/posts.log"\n')
     ai.chmod(0o755)
     t.extra = f'MY_AI="my-ai"\nJOB_PATH="{ai.parent}"\n'
-    rc, _, errs = t.run(["--test-post"])
+    rc, _, errs = t.run(["--test-send"])
     posted = (ai.parent / "posts.log").read_text() if (ai.parent / "posts.log").exists() else ""
-    t.check(rc == 0 and posted.startswith("watcher ") and "test post" in posted and "[rc 0]" in errs,
-            f"one post to WATCH_TO, found on JOB_PATH, rc beside it: {posted!r} {errs}")
+    t.check(rc == 0 and posted.startswith("watcher ") and "test message" in posted and "[rc 0]" in errs,
+            f"one message to WATCH_TO, found on JOB_PATH, rc beside it: {posted!r} {errs}")
     (ai.parent / "busy").write_text("")
-    rc, _, errs = t.run(["--test-post"])
+    rc, _, errs = t.run(["--test-send"])
     t.check(rc == 1 and "the watcher is busy" in errs and "ERROR" in errs
             and not read_state(t.dir / "state" / WATCH_QUEUE), f"refused: an error, nothing queued: {errs}")
     t.extra = f'MY_AI="my-ai"\nJOB_PATH="{t.dir}/nowhere"\n'
-    rc, _, errs = t.run(["--test-post"])
+    rc, _, errs = t.run(["--test-send"])
     t.check(rc == 1 and "no my-ai on JOB_PATH" in errs, f"my-ai not on JOB_PATH: an error naming it: {errs}")
 
 
 def t_install_watch(t: T) -> None:
     """--install shows each part [ ok ] or [FIX] and changes nothing; go
     writes the job (this build, -Q watch, every WATCH_INTERVAL, JOB_PATH),
-    loads it, makes the log directory and adds the rule for the posts --
-    the job's Python via ssh to WATCH_SSH_HOST, port 22, owner system, no
+    loads it, makes the log directory and adds the rule for the messages --
+    the job's Python via ssh to WATCH_SSH_HOST, port 22, for anyone, no
     twin; a second go finds nothing; a changed interval is a job to fix;
     without WATCH_SSH_HOST no rule is needed."""
     t.passed_roundtrip()
@@ -3391,9 +3398,9 @@ def t_install_watch(t: T) -> None:
             f"my-rollout's owner comment after the DOCTYPE, no '--' inside: {lines[:4]}")
     added = t.rules()[n:]
     t.check(len(added) == 1 and added[0].get("remote-hosts") == "ada" and added[0].get("ports") == "22"
-            and added[0].get("owner") == "system" and added[0].get("via") == "identifier.APPLE/com.apple.ssh"
+            and "owner" not in added[0] and "uid" not in added[0] and added[0].get("via") == "identifier.APPLE/com.apple.ssh"
             and str(added[0].get("process", "")).endswith("/Python.app/Contents/MacOS/Python"),
-            f"the rule for the posts, no twin: {added}")
+            f"the rule for the messages, for anyone, no twin: {added}")
     rc, out, errs = t.run(["--install", "go"])
     t.check(rc == 0 and "[FIX]" not in out and "nothing to fix" in errs and len(t.rules()) == n + 1
             and (t.dir / "lc.log").read_text().count("bootstrap") == 1, f"a second go finds nothing: {out} {errs}")
@@ -3689,7 +3696,7 @@ def t_version(t: T) -> None:
 
 TESTS: Final[List[Callable[[T], None]]] = [
     t_list_verdicts, t_allow_shows_then_go, t_allow_clears_beating_denies, t_unsigned_gets_terminal_twin, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_upgrade_carries_rules, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
-    t_verify_after_restore, t_cleanup_asks_about_blocking, t_watch_posts_new_denies, t_test_post, t_install_watch, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_log_shows_parent, t_refusals, t_lock, t_output_layers, t_create_config,
+    t_verify_after_restore, t_cleanup_asks_about_blocking, t_watch_sends_new_denies, t_test_send, t_install_watch, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_log_shows_parent, t_refusals, t_lock, t_output_layers, t_create_config,
     t_site_conf_gives_the_bases_the_search_and_the_offer, t_site_conf_cannot_tell_is_an_error, t_config_offer_names_only_searched_paths,
     t_ctrl_c, t_version,
 ]

@@ -28,7 +28,7 @@ my-little-snitch edits the exported model and restores it -- carefully, see
     my-little-snitch watch
     my-little-snitch diag roundtrip [go] | diag events [--since 10m]
     my-little-snitch --install [go]
-    my-little-snitch --test-post
+    my-little-snitch --test-send
 
 Every command that changes rules shows what it would do; with `go` it does it.
 
@@ -206,15 +206,18 @@ port, protocol, owner and direction: an alert answered Deny, or Little Snitch
 denying by itself -- a program that needs a rule from the tool that owns it.
 A deny you set on purpose is never reported.
 
-- **Where it reports:** run by the job, one line per connection, posted to
-  the my-ai session `WATCH_TO` (default `watcher`) by `my-ai post` -- once,
-  then again every `WATCH_REPEAT` (default `1d`) while it keeps happening:
+- **Where it reports:** run by the job, one line per connection, sent to
+  the my-ai session `WATCH_TO` (default `watcher`) by `my-ai send --as "app
+  my-little-snitch"` -- once, then again every `WATCH_REPEAT` (default `1d`)
+  while it keeps happening. send puts it in the session's inbox, delivered
+  when the session is idle; run by root, my-ai becomes its session user
+  itself:
 
       my-little-snitch@ada: DENIED Python -> imap.mailbox.org:993 (owner alice, 4 denied, 15:40:12) -- no deny rule asked for it: my-little-snitch log Python --denied
       my-little-snitch@ada: DENIED Python -> imap.mailbox.org:993 (owner alice, 31 denied since 2026-11-15 15:40) -- still, no deny rule asked for it
 
-- **A post that cannot go out now waits:** while the session is busy or the
-  session host cannot be reached it is queued, retried on every run, oldest
+- **A message my-ai cannot take now waits:** while the session host cannot
+  be reached (my-ai's rc is not 0) it is queued, retried on every run, oldest
   first, and delivered with its time: `(queued 15:41, sent 15:47 [6 retries])`.
 - **What it cannot watch, it reports too,** by the same path and as often:
   Little Snitch cannot be read, or it kept no traffic at all for
@@ -224,9 +227,9 @@ A deny you set on purpose is never reported.
   it, it is in no source (not in the traffic history, not in Little Snitch's
   own log, not as a socket), and a cancelled alert leaves no row. Only a
   later Deny shows.
-- **At a terminal** it prints what it would post, posts nothing and keeps no
+- **At a terminal** it prints what it would send, sends nothing and keeps no
   state, so the job's next run still sees it all.
-- Its state -- where the last run's read ended, what it posted, the queue --
+- Its state -- where the last run's read ended, what it sent, the queue --
   is in `BACKUP_DIR` (`watch.*`), each file written through a temp file and a
   rename, so a sleep or a power cut leaves nothing torn. It only reads: the
   fix stays with the tool that owns the program, whose `--install` writes
@@ -243,22 +246,22 @@ build <id> -->`); a job without it is rewritten, not reloaded:
   60), with `JOB_PATH` (launchd's own PATH would find Apple's python3), its
   output into `WATCH_LOG`;
 - `BACKUP_DIR` and the folder of `WATCH_LOG`;
-- the Little Snitch rule for the watch's posts where they leave the machine:
-  with `WATCH_SSH_HOST` set (my-ai's session host, seen from here), an allow
-  for the job's Python via ssh to it, port 22, owner system. Where `my-ai
-  post` stays on the machine (`WATCH_SSH_HOST=""`, the session host itself)
-  it types into tmux over a unix socket, which Little Snitch does not
-  filter: no rule.
+- the Little Snitch rule for the watch's messages where they leave the
+  machine: with `WATCH_SSH_HOST` set (my-ai's session host, seen from here),
+  an allow for the job's Python via ssh to it, port 22, for anyone -- my-ai
+  runs the ssh as its session user, whom only my-ai knows, so the rule keeps
+  no copy of that user. Where my-ai stays on the machine (`WATCH_SSH_HOST=""`,
+  the session host itself) it uses no network: no rule.
 
       # my-little-snitch --install
       [FIX] job eu.example.my-little-snitch_watch: not installed (every 60 s, as root)
       [ ok ] state and log directories: /var/db/root/my-little-snitch, /var/log/root
-      [FIX] rule: /opt/homebrew/Cellar/python@3.15/*/.../Python via APPLE/com.apple.ssh  allow  ada  tcp/22  system (the watch's posts go by ssh to ada)
+      [FIX] rule: /opt/homebrew/Cellar/python@3.15/*/.../Python via APPLE/com.apple.ssh  allow  192.168.192.252  tcp/22  anyone (the watch's messages go by ssh to 192.168.192.252)
        >>> 2 to fix: my-little-snitch --install go
 
-**--test-post** -- ONE test line to `WATCH_TO` by exactly the watch's path:
+**--test-send** -- ONE test line to `WATCH_TO` by exactly the watch's path:
 `MY_AI`, found on `JOB_PATH` only (the PATH the job runs with), then `my-ai
-post`. It says so with my-ai's rc, and is an error when the line does not go
+send`. It says so with my-ai's rc, and is an error when the line does not go
 out -- never queued, since it is the proof that the path works. A tool in a
 folder off `JOB_PATH` (`/LINKS/bin`) is named by its full path in `MY_AI`.
 
