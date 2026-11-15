@@ -272,7 +272,9 @@ folder off `JOB_PATH` (`/LINKS/bin`) is named by its full path in `MY_AI`.
 
 `littlesnitch restore-model` replaces the whole model, so each change:
 
-1. exports the model -- the backup, `BACKUP_DIR/<local time>.json` (0600)
+1. exports the model -- the backup, `BACKUP_DIR/<local time to the microsecond>.json`
+   (0600); after a change that went through, only the newest `BACKUP_KEEP`
+   (default 50) stay, and the line removing older ones says so
 2. changes a copy
 3. exports again; if a rule was added, removed or edited since step 1, it
    refuses and names it: restoring would undo that. What Little Snitch
@@ -329,7 +331,7 @@ version folder as `*`); `log` shows and matches them as paths.
 ## Config
 
 `my-little-snitch --create-config` prints it: `LITTLESNITCH`, `BACKUP_DIR`
-(default `$DATA_BASE_DIR/<user>/my-little-snitch`), `OWNER_DEFAULT`,
+(default `$DATA_BASE_DIR/<user>/my-little-snitch`), `BACKUP_KEEP`, `OWNER_DEFAULT`,
 `PROGRAM_PATH`; for `watch` `WATCH_TO`, `WATCH_REPEAT`, `WATCH_SILENT`,
 `MY_AI`, `WATCH_SSH_HOST`; for `--install` `LAUNCHD_PREFIX`,
 `LAUNCHD_DAEMON_DIR`, `LAUNCHCTL`, `WATCH_INTERVAL`, `JOB_PATH`, `WATCH_LOG`

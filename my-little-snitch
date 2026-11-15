@@ -119,6 +119,9 @@ LITTLESNITCH="/Applications/Little Snitch.app/Contents/Components/littlesnitch"
 ## the site file (/var/db without it), the user, the tool. Root only (0700).
 BACKUP_DIR="$DATA_BASE_DIR/$USER/my-little-snitch"
 
+## how many of those backups are kept: after each change, the older ones go
+BACKUP_KEEP="50"
+
 ## the owner of a new rule when --owner is not given: a user name (Little
 ## Snitch's "Me" of that user), "anyone" or "system". "": --owner is required.
 OWNER_DEFAULT=""
@@ -162,6 +165,7 @@ class Settings:
     files: Tuple[Path, ...]
     littlesnitch: str
     backup_dir: Path
+    backup_keep: int
     owner_default: str
     program_path: Tuple[str, ...]
     watch_to: str
@@ -358,6 +362,12 @@ def seconds_of(value: str, key: str, where: str) -> int:
     return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
 
 
+def count_of(value: str, key: str, where: str) -> int:
+    if not value.isdigit() or int(value) == 0:
+        err("00069", f"{where}: {key}=\"{value}\" -- a number above 0 (0 would keep not even the backup just written)")
+    return int(value)
+
+
 def load_settings(override: Optional[str]) -> Settings:
     """The config: the defaults, then <FILE>.GLOBAL, then <FILE> on top."""
     phase("reading the config")
@@ -389,6 +399,7 @@ def load_settings(override: Optional[str]) -> Settings:
     where = " + ".join(str(p) for p in files)
     return Settings(
         files=tuple(files), littlesnitch=names["LITTLESNITCH"], backup_dir=Path(names["BACKUP_DIR"]),
+        backup_keep=count_of(names["BACKUP_KEEP"], "BACKUP_KEEP", where),
         owner_default=names["OWNER_DEFAULT"],
         program_path=tuple(d for d in names["PROGRAM_PATH"].split(":") if d),
         watch_to=names["WATCH_TO"], watch_repeat=seconds_of(names["WATCH_REPEAT"], "WATCH_REPEAT", where),
@@ -746,7 +757,8 @@ def change_model(s: Settings, change: Callable[[List[Rule]], List[Rule]], expect
         err("00027", f"no change before '{SCRIPT_NAME} diag roundtrip go' has passed on this machine: "
                      "it proves a restore loses nothing")
     with locked(s):
-        backup = s.backup_dir / f"{datetime.datetime.now():%Y-%m-%d_%H%M%S}.json"
+        # to the microsecond: two changes in one second (an --install's burst) are two backups
+        backup = s.backup_dir / f"{datetime.datetime.now():%Y-%m-%d_%H%M%S_%f}.json"
         phase("exporting the rules (the backup)")
         model = export_model(s, backup)
         os.chmod(backup, 0o600)
@@ -777,7 +789,24 @@ def change_model(s: Settings, change: Callable[[List[Rule]], List[Rule]], expect
             for p in (new, check):
                 with contextlib.suppress(OSError):
                     p.unlink()
+        prune_backups(s)
     return backup
+
+
+_BACKUP_NAME: Final = "????-??-??_??????*.json"    # change_model's backups, oldest first by name (an
+                                                    # older one without the microseconds sorts first)
+
+
+def prune_backups(s: Settings) -> None:
+    """Only the newest BACKUP_KEEP backups stay: one is written per change,
+    2-3 MB each, and nothing else ever removes them. Run after a change
+    that went through -- a failed one keeps its backup, the remedy."""
+    backups = sorted(s.backup_dir.glob(_BACKUP_NAME))
+    old = backups[:-s.backup_keep]
+    for f in old:
+        f.unlink()
+    if old:
+        OUT.msg(f"    > removed {len(old)} old backup(s) (BACKUP_KEEP {s.backup_keep}): {old[0].name} .. {old[-1].name}")
 
 
 def temporary(r: Rule) -> bool:
@@ -2180,7 +2209,8 @@ RULES
                        rule with the new program; with go, adds them. Run
                        after brew upgrade
 
-  A change exports the rules (the backup, in BACKUP_DIR), exports again and
+  A change exports the rules (the backup, in BACKUP_DIR; the newest
+  BACKUP_KEEP are kept), exports again and
   refuses if a rule moved meanwhile, restores, and checks the result. Not
   atomic: a rule Little Snitch itself makes during the restore call is lost.
   It ends the temporary rules ("until logout"...): the restore expires them,
@@ -3134,6 +3164,35 @@ def t_python_is_its_app(t: T) -> None:
             == "cleanup?[never-matches]", "a stored rule with such a '*' is marked as never matching")
 
 
+def t_backups_are_pruned(t: T) -> None:
+    """After a change, only the newest BACKUP_KEEP backups (<date>_<time>.json,
+    one per change) are left -- horse held 400 of them, 0.7 GB, by 2026-11-15.
+    Nothing else in BACKUP_DIR is touched: not the roundtrip record, the kept
+    denies, the watch's state, nor a .json named otherwise. A failed change
+    prunes nothing."""
+    t.passed_roundtrip()
+    state = t.dir / "state"
+    old = [state / f"2026-10-{d:02d}_120000.json" for d in range(1, 6)]
+    others = [state / "kept", state / WATCH_SEEN, state / "notes.json", state / "2026-10-01.json"]
+    for f in old + others:
+        f.write_text("x")
+    t.extra = 'BACKUP_KEEP="3"\n'
+    rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
+    left = sorted(f.name for f in state.glob("????-??-??_??????*.json"))
+    t.check(rc == 0 and len(left) == 3 and left[:2] == ["2026-10-04_120000.json", "2026-10-05_120000.json"],
+            f"the newest 3 left, the new backup among them: {left} {errs}")
+    t.check("removed 3 old backup(s) (BACKUP_KEEP 3)" in errs, f"said, with the setting: {errs}")
+    t.check(all(f.exists() for f in others) and (state / ROUNDTRIP_OK).exists(), "nothing else touched")
+    t.mode("lossy")
+    rc, _, errs = t.run(["allow", "go", "aria2c", "y.org"])
+    t.check(rc == 1 and len(list(state.glob("????-??-??_??????*.json"))) == 4,
+            f"a failed change prunes nothing -- its backup is the remedy, and one written in the same "
+            f"second as the last is a backup of its own: {sorted(f.name for f in state.glob('*.json'))} {errs}")
+    t.extra = 'BACKUP_KEEP="0"\n'
+    rc, _, errs = t.run(["list"])
+    t.check(rc == 1 and "BACKUP_KEEP" in errs, f"0 would keep not even the backup just written: {errs}")
+
+
 def t_roundtrip_gate(t: T) -> None:
     rc, _, errs = t.run(["allow", "go", "aria2c", "x.org"])
     t.check(rc == 1 and "diag roundtrip go" in errs and len(t.rules()) == 5, f"no change before the roundtrip: {errs}")
@@ -3699,7 +3758,7 @@ def t_version(t: T) -> None:
 
 
 TESTS: Final[List[Callable[[T], None]]] = [
-    t_list_verdicts, t_allow_shows_then_go, t_allow_clears_beating_denies, t_unsigned_gets_terminal_twin, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_upgrade_carries_rules, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
+    t_list_verdicts, t_allow_shows_then_go, t_allow_clears_beating_denies, t_unsigned_gets_terminal_twin, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_upgrade_carries_rules, t_python_is_its_app, t_backups_are_pruned, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
     t_verify_after_restore, t_cleanup_asks_about_blocking, t_watch_sends_new_denies, t_test_send, t_install_watch, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_log_shows_parent, t_refusals, t_lock, t_output_layers, t_create_config,
     t_site_conf_gives_the_bases_the_search_and_the_offer, t_site_conf_cannot_tell_is_an_error, t_config_offer_names_only_searched_paths,
     t_ctrl_c, t_version,
