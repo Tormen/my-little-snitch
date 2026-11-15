@@ -224,9 +224,12 @@ A deny you set on purpose is never reported.
   `WATCH_SILENT` (default `1d`) -- any Mac moves traffic every minute, so an
   empty history means Little Snitch keeps none, and the watch sees nothing.
 - **A connection held at an alert is not seen:** while Little Snitch holds
-  it, it is in no source (not in the traffic history, not in Little Snitch's
-  own log, not as a socket, and no line of the macOS log names the program
-  or its host), and a cancelled alert leaves no row. Only a later Deny shows.
+  it, it is not in the traffic history or Little Snitch's own log, and a
+  cancelled alert leaves no row. Only a later Deny shows. The macOS log does
+  show the alert, but only at Debug level, which macOS does not store: a
+  `log stream --level debug` running at that moment sees Little Snitch Agent
+  look up the held program by its pid (`_LSCopyMatchingApplications(...
+  "pid"=<pid>)`) and build its "Connection alert" (ada, 2026-11-15).
 - **At a terminal** it prints what it would send, sends nothing and keeps no
   state, so the job's next run still sees it all.
 - Its state -- where the last run's read ended, what it sent, the queue --
