@@ -1805,8 +1805,10 @@ def _host() -> str:
 
 
 def post(s: Settings, line: str) -> Tuple[bool, str]:
-    """my-ai post WATCH_TO LINE: whether it went out, and why not."""
-    prog = s.my_ai if "/" in s.my_ai else shutil.which(s.my_ai, path=s.job_path + ":" + os.environ.get("PATH", ""))
+    """my-ai post WATCH_TO LINE: whether it went out, and why not. MY_AI is
+    found on JOB_PATH only -- the PATH the job runs with -- so a run at a
+    terminal finds what the job finds."""
+    prog = s.my_ai if "/" in s.my_ai else shutil.which(s.my_ai, path=s.job_path)
     if not prog:
         return False, f"no {s.my_ai} on JOB_PATH"
     try:
@@ -1926,6 +1928,21 @@ def cmd_watch(s: Settings, args: Sequence[str]) -> int:
         oldest = datetime.datetime.fromtimestamp(int(queued[0].split("\t")[0]))
         tail = f"; {len(queued)} post(s) queued since {oldest:%H:%M}"
     OUT.msg(f" >>> {span}: {len(rows)} connection(s) read, " + (f"{new} to post" if new else "nothing new denied") + tail)
+    return 0
+
+
+def cmd_test_post(s: Settings, args: Sequence[str]) -> int:
+    """ONE test line to WATCH_TO by exactly watch's path; an error when it
+    does not go out -- never queued: it is the proof the path works."""
+    if args:
+        err("00067", "--test-post takes nothing")
+    phase("posting a test line")
+    line = (f"{SCRIPT_NAME}@{_host()}: test post by the watch's path, as {pwd.getpwuid(_geteuid()).pw_name}, "
+            f"{datetime.datetime.now():%Y-%m-%d %H:%M}, config {' + '.join(map(str, s.files))} -- no action needed")
+    ok, why = post(s, line)
+    if not ok:
+        err("00068", f"test post to {s.watch_to} not sent: {why}")
+    OUT.msg(f" >>> test post sent to {s.watch_to} {why}")
     return 0
 
 
@@ -2194,6 +2211,8 @@ ADMIN
                        WATCH_INTERVAL s), its state and log directories, and
                        the rule for its posts; shows what is missing, go
                        sets it up
+  --test-post          one test line to WATCH_TO by exactly watch's path
+                       (MY_AI on JOB_PATH); an error when it does not go out
 
 OPTIONS
   -Q, --quiet              nothing on the terminal but results and errors
@@ -2253,7 +2272,7 @@ def parse_cli(argv: Sequence[str]) -> Cli:
             if not v:
                 err("00049", "--config needs a <FILE>")
             c.config = v
-        elif a == "--install" and c.command is None:
+        elif a in ("--install", "--test-post") and c.command is None:
             c.command = a
         elif a in ("-h", "--help"):
             c.command = "help"
@@ -2323,6 +2342,8 @@ def run(argv: Sequence[str]) -> int:
         return cmd_watch(s, c.args)
     if c.command == "--install":
         return cmd_install(s, c.args)
+    if c.command == "--test-post":
+        return cmd_test_post(s, c.args)
     return cmd_diag(s, c.args)
 
 
@@ -2339,7 +2360,7 @@ _{SCRIPT_NAME.replace('-', '_')}() {{
     _describe command cmds
     _arguments '-Q[quiet]' '-V[verbose]' '-D[debug]' '--config[config file]:file:_files' \\
       '--create-config[the default config]' '--run-tests[the built-in tests]' '--version[the exact build]' \\
-      '--install[the watch job]'
+      '--install[the watch job]' '--test-post[one test post by the watch path]'
     return
   fi
   case $words[2] in
@@ -3301,6 +3322,30 @@ def t_watch_posts_new_denies(t: T) -> None:
         _attended = old
 
 
+def t_test_post(t: T) -> None:
+    """--test-post sends ONE line by exactly watch's path (MY_AI found on
+    JOB_PATH, post to WATCH_TO) and says so with my-ai's rc; when my-ai
+    cannot post -- refused, or not on JOB_PATH at all, as /LINKS/bin's was
+    not on macado (look 153334) -- it fails, and queues nothing."""
+    ai = t.dir / "ai" / "my-ai"
+    ai.parent.mkdir()
+    ai.write_text('#!/bin/sh\nd=$(dirname "$0")\n[ -e "$d/busy" ] && { echo "the watcher is busy" >&2; exit 1; }\n'
+                  'printf \'%s %s\\n\' "$2" "$3" >> "$d/posts.log"\n')
+    ai.chmod(0o755)
+    t.extra = f'MY_AI="my-ai"\nJOB_PATH="{ai.parent}"\n'
+    rc, _, errs = t.run(["--test-post"])
+    posted = (ai.parent / "posts.log").read_text() if (ai.parent / "posts.log").exists() else ""
+    t.check(rc == 0 and posted.startswith("watcher ") and "test post" in posted and "[rc 0]" in errs,
+            f"one post to WATCH_TO, found on JOB_PATH, rc beside it: {posted!r} {errs}")
+    (ai.parent / "busy").write_text("")
+    rc, _, errs = t.run(["--test-post"])
+    t.check(rc == 1 and "the watcher is busy" in errs and "ERROR" in errs
+            and not read_state(t.dir / "state" / WATCH_QUEUE), f"refused: an error, nothing queued: {errs}")
+    t.extra = f'MY_AI="my-ai"\nJOB_PATH="{t.dir}/nowhere"\n'
+    rc, _, errs = t.run(["--test-post"])
+    t.check(rc == 1 and "no my-ai on JOB_PATH" in errs, f"my-ai not on JOB_PATH: an error naming it: {errs}")
+
+
 def t_install_watch(t: T) -> None:
     """--install shows each part [ ok ] or [FIX] and changes nothing; go
     writes the job (this build, -Q watch, every WATCH_INTERVAL, JOB_PATH),
@@ -3644,7 +3689,7 @@ def t_version(t: T) -> None:
 
 TESTS: Final[List[Callable[[T], None]]] = [
     t_list_verdicts, t_allow_shows_then_go, t_allow_clears_beating_denies, t_unsigned_gets_terminal_twin, t_allow_incoming, t_apple_is_its_identity, t_signed_is_its_identity, t_allow_via, t_allow_owner_root, t_allow_udp, t_allow_icmp, t_allow_address, t_allow_address_order, t_allow_local_net, t_remote_one_kind, t_list_lagging_versions, t_upgrade_carries_rules, t_python_is_its_app, t_roundtrip_gate, t_refuse_if_changed, t_settling_is_no_change, t_temporary_rules_end,
-    t_verify_after_restore, t_cleanup_asks_about_blocking, t_watch_posts_new_denies, t_install_watch, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_log_shows_parent, t_refusals, t_lock, t_output_layers, t_create_config,
+    t_verify_after_restore, t_cleanup_asks_about_blocking, t_watch_posts_new_denies, t_test_post, t_install_watch, t_remove_and_cleanup, t_log, t_log_by_name, t_log_rule_form, t_log_ignores_case, t_log_shows_parent, t_refusals, t_lock, t_output_layers, t_create_config,
     t_site_conf_gives_the_bases_the_search_and_the_offer, t_site_conf_cannot_tell_is_an_error, t_config_offer_names_only_searched_paths,
     t_ctrl_c, t_version,
 ]

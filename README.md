@@ -28,6 +28,7 @@ my-little-snitch edits the exported model and restores it -- carefully, see
     my-little-snitch watch
     my-little-snitch diag roundtrip [go] | diag events [--since 10m]
     my-little-snitch --install [go]
+    my-little-snitch --test-post
 
 Every command that changes rules shows what it would do; with `go` it does it.
 
@@ -254,6 +255,12 @@ build <id> -->`); a job without it is rewritten, not reloaded:
       [ ok ] state and log directories: /var/db/root/my-little-snitch, /var/log/root
       [FIX] rule: /opt/homebrew/Cellar/python@3.15/*/.../Python via APPLE/com.apple.ssh  allow  ada  tcp/22  system (the watch's posts go by ssh to ada)
        >>> 2 to fix: my-little-snitch --install go
+
+**--test-post** -- ONE test line to `WATCH_TO` by exactly the watch's path:
+`MY_AI`, found on `JOB_PATH` only (the PATH the job runs with), then `my-ai
+post`. It says so with my-ai's rc, and is an error when the line does not go
+out -- never queued, since it is the proof that the path works. A tool in a
+folder off `JOB_PATH` (`/LINKS/bin`) is named by its full path in `MY_AI`.
 
 **diag events** -- Little Snitch's own messages (`littlesnitch log`).
 
