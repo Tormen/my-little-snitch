@@ -25,7 +25,9 @@ my-little-snitch edits the exported model and restores it -- carefully, see
     my-little-snitch cleanup [go]
     my-little-snitch upgrade [go]
     my-little-snitch log [<PROCESS>|<FILTER>] [--since 1h] [--denied]
+    my-little-snitch watch
     my-little-snitch diag roundtrip [go] | diag events [--since 10m]
+    my-little-snitch --install [go]
 
 Every command that changes rules shows what it would do; with `go` it does it.
 
@@ -195,6 +197,61 @@ months (back to 2025-08-13 on 2026-10-28, 3 million lines).
 
     my-little-snitch log aria2c --since 1d --denied
 
+**watch** -- what Little Snitch denied since the last run that no deny rule
+asked for, for the jobs nobody is watching. It reads the traffic history from
+the last run on and the rules. A connection counts when Little Snitch denied
+it and no live deny rule covers its program (or the app it runs for), remote,
+port, protocol, owner and direction: an alert answered Deny, or Little Snitch
+denying by itself -- a program that needs a rule from the tool that owns it.
+A deny you set on purpose is never reported.
+
+- **Where it reports:** run by the job, one line per connection, posted to
+  the my-ai session `WATCH_TO` (default `watcher`) by `my-ai post` -- once,
+  then again every `WATCH_REPEAT` (default `1d`) while it keeps happening:
+
+      my-little-snitch@ada: DENIED Python -> imap.mailbox.org:993 (owner alice, 4 denied, 15:40:12) -- no deny rule asked for it: my-little-snitch log Python --denied
+      my-little-snitch@ada: DENIED Python -> imap.mailbox.org:993 (owner alice, 31 denied since 2026-11-15 15:40) -- still, no deny rule asked for it
+
+- **A post that cannot go out now waits:** while the session is busy or the
+  session host cannot be reached it is queued, retried on every run, oldest
+  first, and delivered with its time: `(queued 15:41, sent 15:47 [6 retries])`.
+- **What it cannot watch, it reports too,** by the same path and as often:
+  Little Snitch cannot be read, or it kept no traffic at all for
+  `WATCH_SILENT` (default `1d`) -- any Mac moves traffic every minute, so an
+  empty history means Little Snitch keeps none, and the watch sees nothing.
+- **A connection held at an alert is not seen:** while Little Snitch holds
+  it, it is in no source (not in the traffic history, not in Little Snitch's
+  own log, not as a socket), and a cancelled alert leaves no row. Only a
+  later Deny shows.
+- **At a terminal** it prints what it would post, posts nothing and keeps no
+  state, so the job's next run still sees it all.
+- Its state -- where the last run's read ended, what it posted, the queue --
+  is in `BACKUP_DIR` (`watch.*`), each file written through a temp file and a
+  rename, so a sleep or a power cut leaves nothing torn. It only reads: the
+  fix stays with the tool that owns the program, whose `--install` writes
+  the rule.
+
+**--install [go]** -- the watch job. The plain run checks each part and shows
+it `[ ok ]` or `[FIX]`; `go` fixes them, and a second `go` finds nothing:
+
+- the LaunchDaemon `<LAUNCHD_PREFIX>_watch`: `my-little-snitch -Q watch` as
+  it was called (the farm's link), every `WATCH_INTERVAL` seconds (default
+  60), with `JOB_PATH` (launchd's own PATH would find Apple's python3), its
+  output into `WATCH_LOG`;
+- `BACKUP_DIR` and the folder of `WATCH_LOG`;
+- the Little Snitch rule for the watch's posts where they leave the machine:
+  with `WATCH_SSH_HOST` set (my-ai's session host, seen from here), an allow
+  for the job's Python via ssh to it, port 22, owner system. Where `my-ai
+  post` stays on the machine (`WATCH_SSH_HOST=""`, the session host itself)
+  it types into tmux over a unix socket, which Little Snitch does not
+  filter: no rule.
+
+      # my-little-snitch --install
+      [FIX] job eu.example.my-little-snitch_watch: not installed (every 60 s, as root)
+      [ ok ] state and log directories: /var/db/root/my-little-snitch, /var/log/root
+      [FIX] rule: /opt/homebrew/Cellar/python@3.15/*/.../Python via APPLE/com.apple.ssh  allow  ada  tcp/22  system (the watch's posts go by ssh to ada)
+       >>> 2 to fix: my-little-snitch --install go
+
 **diag events** -- Little Snitch's own messages (`littlesnitch log`).
 
 ## How a change is made
@@ -259,7 +316,12 @@ version folder as `*`); `log` shows and matches them as paths.
 
 `my-little-snitch --create-config` prints it: `LITTLESNITCH`, `BACKUP_DIR`
 (default `$DATA_BASE_DIR/<user>/my-little-snitch`), `OWNER_DEFAULT`,
-`PROGRAM_PATH`, `QUIET`/`VRB`/`DBG`. Search order, first found wins:
+`PROGRAM_PATH`; for `watch` `WATCH_TO`, `WATCH_REPEAT`, `WATCH_SILENT`,
+`MY_AI`, `WATCH_SSH_HOST`; for `--install` `LAUNCHD_PREFIX`,
+`LAUNCHD_DAEMON_DIR`, `LAUNCHCTL`, `WATCH_INTERVAL`, `JOB_PATH`, `WATCH_LOG`
+(default `$LOG_BASE_DIR/<user>/my-little-snitch.log`); `QUIET`/`VRB`/`DBG`.
+A value that differs per machine (`WATCH_SSH_HOST`: empty on the session
+host) goes into that machine's own file, read after the global one. Search order, first found wins:
 `$MY_LITTLE_SNITCH_CONFIG`, `--config <FILE>`,
 `$CONFIG_SEARCH_DIR/my-little-snitch.conf`, `$CONFIG_SEARCH_DIR/my-little-snitch`,
 `~/.my-little-snitch.conf`, `/etc/my-little-snitch.conf`,
@@ -268,11 +330,12 @@ version folder as `*`); `log` shows and matches them as paths.
 **A site file, read first.** `/LINKS/default/site.conf`, when it exists, is
 read before the config -- the one site path in my-little-snitch. Plain
 `KEY="value"` lines, for every tool of a site, parsed and never run:
-`DATA_BASE_DIR` (`BACKUP_DIR`'s default lies under it), `CONFIG_SEARCH_DIR`
+`DATA_BASE_DIR` (`BACKUP_DIR`'s default lies under it), `LOG_BASE_DIR`
+(`WATCH_LOG`'s), `CONFIG_SEARCH_DIR`
 (searched as above), `CONFIG_OFFER_DIR` and `CONFIG_OFFER_NOTE` (where "no
 config found" offers to write one, and the note beside it -- only while
 `CONFIG_SEARCH_DIR` is searched, never that directory itself). Without the
-file: `/var/db`, no search directory, no site offer -- it works with no
+file: `/var/db`, `/var/log`, no search directory, no site offer -- it works with no
 setup. There but unreadable: an error, never the fallback, which would keep
 this user's state apart from everyone else's. Environment variables are
 never read for these: a LaunchDaemon, `sudo` and a login shell would each
