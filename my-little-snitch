@@ -1808,14 +1808,15 @@ def send_line(s: Settings, line: str) -> Tuple[bool, str]:
     """my-ai send WATCH_TO --as "app my-little-snitch" LINE: whether it went
     out, and why not. send stores the line in the session's inbox and my-ai
     delivers it when the session is idle (post would be refused while it
-    works); run by root, my-ai becomes its session user itself. MY_AI is
+    works); run by root, my-ai becomes its session user itself, and
+    refuses a folder that user cannot enter -- so it runs from /. MY_AI is
     found on JOB_PATH only -- the PATH the job runs with -- so a run at a
     terminal finds what the job finds."""
     prog = s.my_ai if "/" in s.my_ai else shutil.which(s.my_ai, path=s.job_path)
     if not prog:
         return False, f"no {s.my_ai} on JOB_PATH"
     try:
-        r = subprocess.run([prog, "send", s.watch_to, "--as", f"app {SCRIPT_NAME}", line],
+        r = subprocess.run([prog, "send", s.watch_to, "--as", f"app {SCRIPT_NAME}", line], cwd="/",
                            capture_output=True, text=True, timeout=120,
                            stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -3330,13 +3331,16 @@ def t_watch_sends_new_denies(t: T) -> None:
 
 def t_test_send(t: T) -> None:
     """--test-send sends ONE line by exactly watch's path (MY_AI found on
-    JOB_PATH, my-ai send to WATCH_TO) and says so with my-ai's rc; when my-ai
+    JOB_PATH, my-ai send to WATCH_TO, run from / -- my-ai, become the
+    session user, refuses a folder that user cannot enter, as root's
+    rollout steps run from) and says so with my-ai's rc; when my-ai
     cannot take it -- refused, or not on JOB_PATH at all, as /LINKS/bin's was
     not on macado (look 153334) -- it fails, and queues nothing."""
     ai = t.dir / "ai" / "my-ai"
     ai.parent.mkdir()
     ai.write_text('#!/bin/sh\nd=$(dirname "$0")\n[ -e "$d/busy" ] && { echo "the watcher is busy" >&2; exit 1; }\n'
                   '[ "$1 $3 $4" = "send --as app my-little-snitch" ] || { echo "called: $*" >&2; exit 2; }\n'
+                  '[ "$(pwd)" = / ] || { echo "run from $(pwd), not /" >&2; exit 3; }\n'
                   'printf \'%s %s\\n\' "$2" "$5" >> "$d/posts.log"\n')
     ai.chmod(0o755)
     t.extra = f'MY_AI="my-ai"\nJOB_PATH="{ai.parent}"\n'

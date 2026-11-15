@@ -261,7 +261,8 @@ build <id> -->`); a job without it is rewritten, not reloaded:
 
 **--test-send** -- ONE test line to `WATCH_TO` by exactly the watch's path:
 `MY_AI`, found on `JOB_PATH` only (the PATH the job runs with), then `my-ai
-send`. It says so with my-ai's rc, and is an error when the line does not go
+send`, run from `/` (my-ai, become its session user, refuses a folder that
+user cannot enter -- root's own, say). It says so with my-ai's rc, and is an error when the line does not go
 out -- never queued, since it is the proof that the path works. A tool in a
 folder off `JOB_PATH` (`/LINKS/bin`) is named by its full path in `MY_AI`.
 
